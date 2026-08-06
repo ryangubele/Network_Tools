@@ -114,6 +114,107 @@ function Send-Stimulus {
     }
 }
 
+function Test-TcpPort {
+    <#
+    .SYNOPSIS
+    Tests TCP connectivity to one or more ports on a target host.
+
+    .DESCRIPTION
+    Attempts a TCP connection using .NET sockets so behavior is consistent across Windows and Linux.
+    Returns reachability and latency details for each tested port.
+
+    .PARAMETER ComputerName
+    Hostname or IP address of the remote target.
+
+    .PARAMETER Port
+    One or more TCP ports to test.
+
+    .PARAMETER TimeoutMs
+    Connection timeout in milliseconds for each TCP probe.
+
+    .PARAMETER Quiet
+    Returns only boolean reachability values instead of detailed objects.
+
+    .PARAMETER ResolveDns
+    Attempts DNS resolution and includes the first IPv4 address in the output.
+
+    .EXAMPLE
+    Test-TcpPort -ComputerName 192.168.1.20 -Port 22,443 -TimeoutMs 800
+    Tests SSH and HTTPS reachability and returns latency details.
+
+    .EXAMPLE
+    'server01' | Test-TcpPort -Port 3389 -Quiet
+    Returns True or False for TCP 3389 reachability on server01.
+    #>
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory = $true, Position = 0, ValueFromPipeline = $true, ValueFromPipelineByPropertyName = $true)]
+        [Alias('Host', 'IPAddress')]
+        [ValidateNotNullOrEmpty()]
+        [string]$ComputerName,
+
+        [Parameter(Mandatory = $true, Position = 1)]
+        [ValidateRange(1, 65535)]
+        [int[]]$Port,
+
+        [ValidateRange(50, 60000)]
+        [int]$TimeoutMs = 1000,
+
+        [switch]$Quiet,
+
+        [switch]$ResolveDns
+    )
+
+    process {
+        foreach ($targetPort in $Port) {
+            $client = [System.Net.Sockets.TcpClient]::new()
+            $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+            $reachable = $false
+            $errorMessage = $null
+            $resolvedAddress = $null
+
+            if ($ResolveDns) {
+                try {
+                    $resolvedAddress = [System.Net.Dns]::GetHostAddresses($ComputerName) |
+                        Where-Object AddressFamily -eq ([System.Net.Sockets.AddressFamily]::InterNetwork) |
+                        Select-Object -ExpandProperty IPAddressToString -First 1
+                }
+                catch {
+                }
+            }
+
+            try {
+                $connectTask = $client.ConnectAsync($ComputerName, $targetPort)
+                if ($connectTask.Wait($TimeoutMs) -and $client.Connected) {
+                    $reachable = $true
+                } else {
+                    $errorMessage = 'Timed out'
+                }
+            }
+            catch {
+                $errorMessage = $_.Exception.Message
+            }
+            finally {
+                $stopwatch.Stop()
+                $client.Dispose()
+            }
+
+            if ($Quiet) {
+                $reachable
+            } else {
+                [PSCustomObject]@{
+                    ComputerName    = $ComputerName
+                    Port            = $targetPort
+                    Reachable       = $reachable
+                    LatencyMs       = [int]$stopwatch.ElapsedMilliseconds
+                    ResolvedAddress = $resolvedAddress
+                    Error           = if ($reachable) { $null } else { $errorMessage }
+                }
+            }
+        }
+    }
+}
+
 function Convert-FromCidr {
     <#
     .SYNOPSIS
@@ -275,4 +376,4 @@ function Invoke-NetworkScan {
 
 Set-Alias -Name Send-InterfaceStimulus -Value Send-Stimulus
 
-Export-ModuleMember -Function Send-Stimulus, Convert-FromCidr, Invoke-NetworkScan -Alias Send-InterfaceStimulus
+Export-ModuleMember -Function Send-Stimulus, Test-TcpPort, Convert-FromCidr, Invoke-NetworkScan -Alias Send-InterfaceStimulus

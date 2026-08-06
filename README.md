@@ -4,9 +4,10 @@ This is a small PowerShell module for everyday network checks and lab tasks.
 
 It is built to run cross platform on Windows and Linux with PowerShell 7.
 
-It currently includes three commands:
+It currently includes four commands:
 
 - Send-Stimulus: sends UDP broadcast traffic from a chosen local interface and source port.
+- Test-TcpPort: tests TCP connectivity to one or more ports with timeout and latency details.
 - Convert-FromCidr: converts CIDR notation into a dotted subnet mask.
 - Invoke-NetworkScan: runs a parallel ping sweep and returns IP, MAC, and latency where available.
 
@@ -35,6 +36,12 @@ Convert CIDR to subnet mask:
 
 ```powershell
 Convert-FromCidr -Cidr 192.168.10.0/24
+```
+
+Test TCP ports:
+
+```powershell
+Test-TcpPort -ComputerName 192.168.1.20 -Port 22,443 -TimeoutMs 800
 ```
 
 Scan a subnet:

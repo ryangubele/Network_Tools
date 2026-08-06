@@ -126,3 +126,61 @@ Describe 'Invoke-NetworkScan' {
         @($result).Count | Should Be 0
     }
 }
+
+Describe 'Test-TcpPort' {
+    It 'returns Reachable true for an open local listener port' {
+        $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
+        try {
+            $listener.Start()
+            $openPort = ([System.Net.IPEndPoint]$listener.LocalEndpoint).Port
+
+            $result = Test-TcpPort -ComputerName '127.0.0.1' -Port $openPort -TimeoutMs 500
+
+            $result.Reachable | Should Be $true
+            $result.Port | Should Be $openPort
+            $result.ComputerName | Should Be '127.0.0.1'
+        }
+        finally {
+            $listener.Stop()
+        }
+    }
+
+    It 'returns boolean output when Quiet is used' {
+        $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
+        try {
+            $listener.Start()
+            $openPort = ([System.Net.IPEndPoint]$listener.LocalEndpoint).Port
+
+            $result = Test-TcpPort -ComputerName '127.0.0.1' -Port $openPort -TimeoutMs 500 -Quiet
+            $result.GetType().Name | Should Be 'Boolean'
+            $result | Should Be $true
+        }
+        finally {
+            $listener.Stop()
+        }
+    }
+
+    It 'validates Port lower bound' {
+        $thrown = $false
+        try {
+            Test-TcpPort -ComputerName '127.0.0.1' -Port 0 -TimeoutMs 200 -ErrorAction Stop | Out-Null
+        }
+        catch {
+            $thrown = $true
+        }
+
+        $thrown | Should Be $true
+    }
+
+    It 'validates Port upper bound' {
+        $thrown = $false
+        try {
+            Test-TcpPort -ComputerName '127.0.0.1' -Port 70000 -TimeoutMs 200 -ErrorAction Stop | Out-Null
+        }
+        catch {
+            $thrown = $true
+        }
+
+        $thrown | Should Be $true
+    }
+}

@@ -5,11 +5,12 @@
     Author = 'Network Engineering Tools'
     CompanyName = 'Community'
     Copyright = '(c) Network Engineering Tools. All rights reserved.'
-    Description = 'PowerShell network engineering toolkit with CIDR conversion, traffic stimulus, and host discovery cmdlets.'
+    Description = 'PowerShell network engineering toolkit with CIDR conversion, traffic stimulus, host discovery, and TCP port testing cmdlets.'
     PowerShellVersion = '7.0'
 
     FunctionsToExport = @(
         'Send-Stimulus',
+        'Test-TcpPort',
         'Convert-FromCidr',
         'Invoke-NetworkScan'
     )
@@ -22,7 +23,7 @@
     VariablesToExport = '*'
     PrivateData = @{
         PSData = @{
-            Tags = @('Networking', 'CIDR', 'Ping', 'Discovery', 'PowerShell')
+            Tags = @('Networking', 'CIDR', 'Ping', 'Discovery', 'TCP', 'PowerShell')
         }
     }
 }
