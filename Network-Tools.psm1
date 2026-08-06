@@ -1,0 +1,278 @@
+function Get-ArpTable {
+    [CmdletBinding()]
+    param ()
+
+    $arpTable = @{}
+
+    if ($IsWindows) {
+        $getNetNeighbor = Get-Command -Name Get-NetNeighbor -ErrorAction SilentlyContinue
+        if ($null -ne $getNetNeighbor) {
+            try {
+                Get-NetNeighbor -AddressFamily IPv4 -ErrorAction Stop |
+                    Where-Object State -ne 'Unreachable' |
+                    ForEach-Object {
+                        $arpTable[$_.IPAddress] = $_.LinkLayerAddress -replace '-', ':'
+                    }
+            }
+            catch {
+            }
+        }
+    } elseif ($IsLinux) {
+        $ipCommand = Get-Command -Name ip -ErrorAction SilentlyContinue
+        if ($null -ne $ipCommand) {
+            try {
+                (ip neigh show) | ForEach-Object {
+                    if ($_ -match '(\d+\.\d+\.\d+\.\d+)\s+dev\s+\S+\s+lladdr\s+([a-fA-F0-9:]+)') {
+                        $arpTable[$matches[1]] = $matches[2]
+                    }
+                }
+            }
+            catch {
+            }
+        }
+    }
+
+    return $arpTable
+}
+
+function Send-Stimulus {
+    <#
+    .SYNOPSIS
+    Sends UDP broadcast stimulus frames from a specific local interface and optional local port.
+
+    .DESCRIPTION
+    Binds a UDP socket to the local interface IP address and sends a configurable number of
+    broadcast UDP frames. This is useful for generating deterministic traffic for
+    switch port tests, capture validation, and basic path stimulation in lab or field networks.
+
+    .PARAMETER InterfaceIP
+    IPv4 address of the local interface to bind for outbound stimulus traffic.
+
+    .PARAMETER LocalPort
+    Local UDP source port used when binding the socket. Use 0 for an ephemeral OS-assigned port.
+
+    .PARAMETER Count
+    Number of stimulus frames to send.
+
+    .PARAMETER DelayMs
+    Delay in milliseconds between each transmitted frame.
+
+    .EXAMPLE
+    Send-Stimulus -InterfaceIP 192.168.1.10 -LocalPort 40000 -Count 50 -DelayMs 10
+    Sends 50 broadcast frames from interface 192.168.1.10 using source port 40000.
+    #>
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]$InterfaceIP,
+
+        [ValidateRange(0, 65535)]
+        [int]$LocalPort = 0,
+
+        [ValidateRange(1, 1000000)]
+        [int]$Count = 100,
+
+        [ValidateRange(0, 60000)]
+        [int]$DelayMs = 50
+    )
+
+    $target = [System.Net.IPAddress]::Broadcast
+    $port = 9
+    $payload = [System.Text.Encoding]::ASCII.GetBytes("STIMULUS")
+
+    $client = $null
+    try {
+        $localEndPoint = [System.Net.IPEndPoint]::new([System.Net.IPAddress]::Parse($InterfaceIP), $LocalPort)
+        $client = [System.Net.Sockets.UdpClient]::new($localEndPoint)
+        $targetEndPoint = [System.Net.IPEndPoint]::new($target, $port)
+
+        1..$Count | ForEach-Object {
+            [void]$client.Send($payload, $payload.Length, $targetEndPoint)
+            Write-Verbose "Frame $_ sent from $InterfaceIP"
+            if ($DelayMs -gt 0) {
+                Start-Sleep -Milliseconds $DelayMs
+            }
+        }
+
+        [PSCustomObject]@{
+            InterfaceIP = $InterfaceIP
+            LocalPort   = $localEndPoint.Port
+            Count       = $Count
+            Target      = $target.IPAddressToString
+            Port        = $port
+            PayloadSize = $payload.Length
+        }
+    }
+    catch {
+        Write-Error $_.Exception.Message
+    }
+    finally {
+        if ($null -ne $client) {
+            $client.Close()
+        }
+    }
+}
+
+function Convert-FromCidr {
+    <#
+    .SYNOPSIS
+    Converts CIDR notation into an IPv4 subnet mask.
+
+    .DESCRIPTION
+    Accepts an IPv4 CIDR string such as 192.168.10.0/24 and returns the source network address,
+    prefix length, and dotted-decimal subnet mask. This helps network engineers translate between
+    prefix and mask formats when documenting or validating network configurations.
+
+    .PARAMETER Cidr
+    IPv4 CIDR input in address/prefix format, such as 192.168.10.0/24.
+
+    .EXAMPLE
+    Convert-FromCidr -Cidr 10.10.0.0/16
+    Returns IPAddress, PrefixLength, and SubnetMask for the specified CIDR block.
+    #>
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory = $true, Position = 0, ValueFromPipeline = $true)]
+        [ValidatePattern('^(?:\d{1,3}\.){3}\d{1,3}/(?:[0-9]|[12][0-9]|3[0-2])$')]
+        [Alias('InputObject')]
+        [string]$Cidr
+    )
+
+    process {
+        $ip, $prefixLength = $Cidr.Split('/')
+
+        $maskInt = if ([int]$prefixLength -eq 0) {
+            [uint32]0
+        } else {
+            [uint32]((0xFFFFFFFFL -shl (32 - [int]$prefixLength)) -band 0xFFFFFFFFL)
+        }
+
+        $maskBytes = [System.BitConverter]::GetBytes($maskInt)
+        [array]::Reverse($maskBytes)
+
+        [PSCustomObject]@{
+            IPAddress    = $ip
+            PrefixLength = [int]$prefixLength
+            SubnetMask   = ([ipaddress]$maskBytes).IPAddressToString
+        }
+    }
+}
+
+function Invoke-NetworkScan {
+    <#
+    .SYNOPSIS
+    Performs a parallel ping sweep and attempts to retrieve MAC addresses from the local ARP cache.
+
+    .DESCRIPTION
+    Accepts CIDR (e.g., 192.168.1.0/24) or standard mask (e.g., 192.168.1.0 255.255.255.0).
+    Requires PowerShell 7+ for the ForEach-Object -Parallel switch.
+
+    .PARAMETER Target
+    Target network expressed as CIDR (192.168.1.0/24) or address plus subnet mask.
+
+    .PARAMETER TimeoutMs
+    ICMP timeout in milliseconds for each host probe.
+
+    .PARAMETER ThrottleLimit
+    Maximum number of concurrent ping operations.
+
+    .EXAMPLE
+    Invoke-NetworkScan -Target 192.168.1.0/24 -TimeoutMs 300 -ThrottleLimit 50
+    Scans the target subnet for reachable hosts and returns IP, MAC, and latency details.
+    #>
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory = $true, Position = 0)]
+        [ValidateNotNullOrEmpty()]
+        [string]$Target,
+
+        [int]$TimeoutMs = 300,
+        [int]$ThrottleLimit = 50
+    )
+
+    $ipStr = ""
+    $maskBits = 0
+    $maskInt = 0
+
+    if ($Target -match '/') {
+        $ipStr, $maskStr = $Target.Split('/')
+        $maskBits = [int]$maskStr
+        # Shift, mask the upper 32 bits to prevent overflow, then cast.
+        $maskInt = [uint32]((0xFFFFFFFFL -shl (32 - $maskBits)) -band 0xFFFFFFFFL)
+    } else {
+        $ipStr, $maskStr = $Target -split '\s+|,', 2
+        $maskBytes = [System.Net.IPAddress]::Parse($maskStr).GetAddressBytes()
+        if ([BitConverter]::IsLittleEndian) {
+            [Array]::Reverse($maskBytes)
+        }
+
+        $maskInt = [BitConverter]::ToUInt32($maskBytes, 0)
+
+        # Calculate CIDR bits by counting 1 bits in the mask.
+        $maskBits = [Convert]::ToString($maskInt, 2).Replace("0", "").Length
+    }
+
+    $ipBytes = [System.Net.IPAddress]::Parse($ipStr).GetAddressBytes()
+    if ([BitConverter]::IsLittleEndian) {
+        [Array]::Reverse($ipBytes)
+    }
+    $ipInt = [BitConverter]::ToUInt32($ipBytes, 0)
+
+    # Base network and broadcast addresses as 32-bit integers.
+    $networkInt = $ipInt -band $maskInt
+    $broadcastInt = $networkInt -bor (-bnot $maskInt)
+
+    $ipList = [System.Collections.Generic.List[string]]::new()
+    for ($i = $networkInt + 1; $i -lt $broadcastInt; $i++) {
+        $bytes = [BitConverter]::GetBytes([uint32]$i)
+        if ([BitConverter]::IsLittleEndian) {
+            [Array]::Reverse($bytes)
+        }
+        $ipList.Add([System.Net.IPAddress]::new($bytes).IPAddressToString)
+    }
+
+    Write-Verbose "Pinging $($ipList.Count) IPs..."
+
+    $liveHosts = $ipList | ForEach-Object -Parallel {
+        $ping = [System.Net.NetworkInformation.Ping]::new()
+        try {
+            $reply = $ping.Send($_, $using:TimeoutMs)
+            if ($reply.Status -eq 'Success') {
+                [PSCustomObject]@{
+                    IPAddress = $_
+                    LatencyMs = $reply.RoundtripTime
+                }
+            }
+        }
+        catch {
+        }
+        finally {
+            $ping.Dispose()
+        }
+    } -ThrottleLimit $ThrottleLimit
+
+    $results = [System.Collections.Generic.List[PSCustomObject]]::new()
+
+    $arpTable = Get-ArpTable
+
+    foreach ($liveHost in $liveHosts) {
+        $mac = if ($arpTable.ContainsKey($liveHost.IPAddress)) {
+            $arpTable[$liveHost.IPAddress]
+        } else {
+            'Unknown'
+        }
+
+        $results.Add([PSCustomObject]@{
+            IPAddress  = $liveHost.IPAddress
+            MACAddress = $mac
+            LatencyMs  = $liveHost.LatencyMs
+        })
+    }
+
+    return $results
+}
+
+Set-Alias -Name Send-InterfaceStimulus -Value Send-Stimulus
+
+Export-ModuleMember -Function Send-Stimulus, Convert-FromCidr, Invoke-NetworkScan -Alias Send-InterfaceStimulus
