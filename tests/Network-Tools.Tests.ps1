@@ -225,11 +225,11 @@ Describe 'Test-TcpPort' {
 }
 
 Describe 'Resolve-MacVendor' {
-    It 'resolves known vendor from built-in OUI map' {
+    It 'resolves known vendor from local OUI map file' {
         $result = Resolve-MacVendor -MacAddress '00-50-56-11-22-33'
 
         $result.Vendor | Should Be 'VMware'
-        $result.Source | Should Be 'BuiltInMap'
+        $result.Source | Should Be 'FileMap'
         $result.NormalizedMac | Should Be '00:50:56:11:22:33'
     }
 
@@ -258,6 +258,16 @@ Describe 'Resolve-MacVendor' {
                 Remove-Item $tempPath -Force
             }
         }
+    }
+
+    It 'supports optional online API fallback for unknown OUIs' {
+        Mock Invoke-RestMethod {
+            'Mock Vendor'
+        } -ModuleName Network-Tools
+
+        $result = Resolve-MacVendor -MacAddress 'AA-BB-CC-11-22-33' -UseOnlineApi
+        $result.Vendor | Should Be 'Mock Vendor'
+        $result.Source | Should Be 'OnlineApi'
     }
 
     It 'rejects invalid MAC address formats' {

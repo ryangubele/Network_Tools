@@ -221,14 +221,21 @@ function Resolve-MacVendor {
     Resolves a MAC address to a likely hardware vendor based on OUI prefix.
 
     .DESCRIPTION
-    Normalizes MAC address input and matches its OUI prefix against a built-in map.
+    Normalizes MAC address input and matches its OUI prefix against a local CSV database.
     You can also supply a custom CSV map file with Prefix and Vendor columns.
+    If enabled, optional online lookup is used when no local match is found.
 
     .PARAMETER MacAddress
     One or more MAC addresses to resolve. Supports common formats with colons, hyphens, or dots.
 
     .PARAMETER OuiMapPath
     Optional path to a CSV file containing Prefix and Vendor columns.
+
+    .PARAMETER UseOnlineApi
+    If set, attempts an online lookup for unknown OUIs.
+
+    .PARAMETER ApiBaseUri
+    Base URI for online lookup requests. Default uses api.macvendors.com.
 
     .EXAMPLE
     Resolve-MacVendor -MacAddress '00:1A:2B:AA:BB:CC'
@@ -237,6 +244,10 @@ function Resolve-MacVendor {
     .EXAMPLE
     '00-50-56-11-22-33','AA:BB:CC:00:11:22' | Resolve-MacVendor
     Resolves vendor names for multiple MAC addresses from pipeline input.
+
+    .EXAMPLE
+    Resolve-MacVendor -MacAddress '40:b0:34:00:11:22' -UseOnlineApi
+    Uses local database first, then online lookup if no local match is found.
     #>
     [CmdletBinding()]
     param (
@@ -246,51 +257,40 @@ function Resolve-MacVendor {
         [string[]]$MacAddress,
 
         [Parameter()]
-        [string]$OuiMapPath
+        [string]$OuiMapPath,
+
+        [Parameter()]
+        [switch]$UseOnlineApi,
+
+        [Parameter()]
+        [ValidateNotNullOrEmpty()]
+        [string]$ApiBaseUri = 'https://api.macvendors.com'
     )
 
     begin {
-        $builtInOui = @{
-            '000C29' = 'VMware'
-            '005056' = 'VMware'
-            '00163E' = 'Xen'
-            '001A2B' = 'Cisco'
-            '001B63' = 'Apple'
-            '000D93' = 'Apple'
-            'F4CE46' = 'Ubiquiti'
-            'A44CC8' = 'Ubiquiti'
-            '3C5A37' = 'Google'
-            'B827EB' = 'Raspberry Pi Foundation'
-            'DCA632' = 'Raspberry Pi Trading'
-            'FCFBFB' = 'Microsoft'
-            'F01FAF' = 'Dell'
-            '3CD92B' = 'Hewlett Packard Enterprise'
-            '0002A5' = 'Juniper Networks'
-            'D067E5' = 'Arista Networks'
+        $ouiMap = @{}
+        $defaultMapPath = Join-Path -Path $PSScriptRoot -ChildPath 'data\\oui-map.csv'
+        $selectedMapPath = if ($OuiMapPath) { $OuiMapPath } else { $defaultMapPath }
+
+        if (-not (Test-Path -Path $selectedMapPath)) {
+            throw "OUI map file not found: $selectedMapPath"
         }
 
-        $customOui = @{}
-        if ($OuiMapPath) {
-            if (-not (Test-Path -Path $OuiMapPath)) {
-                throw "OUI map file not found: $OuiMapPath"
-            }
+        try {
+            $rows = Import-Csv -Path $selectedMapPath -ErrorAction Stop
+            foreach ($row in $rows) {
+                if ($null -eq $row.Prefix -or $null -eq $row.Vendor) {
+                    continue
+                }
 
-            try {
-                $rows = Import-Csv -Path $OuiMapPath -ErrorAction Stop
-                foreach ($row in $rows) {
-                    if ($null -eq $row.Prefix -or $null -eq $row.Vendor) {
-                        continue
-                    }
-
-                    $prefix = (($row.Prefix -replace '[^0-9A-Fa-f]', '').ToUpper())
-                    if ($prefix.Length -ge 6) {
-                        $customOui[$prefix.Substring(0, 6)] = [string]$row.Vendor
-                    }
+                $prefix = (($row.Prefix -replace '[^0-9A-Fa-f]', '').ToUpper())
+                if ($prefix.Length -ge 6) {
+                    $ouiMap[$prefix.Substring(0, 6)] = [string]$row.Vendor
                 }
             }
-            catch {
-                throw "Failed to read OUI map file '$OuiMapPath': $($_.Exception.Message)"
-            }
+        }
+        catch {
+            throw "Failed to read OUI map file '$selectedMapPath': $($_.Exception.Message)"
         }
     }
 
@@ -307,13 +307,22 @@ function Resolve-MacVendor {
             $vendor = 'Unknown'
             $source = 'None'
 
-            if ($customOui.ContainsKey($prefix)) {
-                $vendor = $customOui[$prefix]
-                $source = 'CustomMap'
+            if ($ouiMap.ContainsKey($prefix)) {
+                $vendor = $ouiMap[$prefix]
+                $source = if ($OuiMapPath) { 'CustomMap' } else { 'FileMap' }
             }
-            elseif ($builtInOui.ContainsKey($prefix)) {
-                $vendor = $builtInOui[$prefix]
-                $source = 'BuiltInMap'
+            elseif ($UseOnlineApi) {
+                try {
+                    $uri = ('{0}/{1}' -f $ApiBaseUri.TrimEnd('/'), $normalized)
+                    $onlineResult = Invoke-RestMethod -Uri $uri -Method Get -TimeoutSec 5 -ErrorAction Stop
+                    $onlineVendor = [string]$onlineResult
+                    if (-not [string]::IsNullOrWhiteSpace($onlineVendor)) {
+                        $vendor = $onlineVendor.Trim()
+                        $source = 'OnlineApi'
+                    }
+                }
+                catch {
+                }
             }
 
             [PSCustomObject]@{

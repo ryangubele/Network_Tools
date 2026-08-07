@@ -51,6 +51,12 @@ Resolve MAC vendor:
 Resolve-MacVendor -MacAddress 00-50-56-11-22-33
 ```
 
+Resolve MAC vendor with optional API fallback:
+
+```powershell
+Resolve-MacVendor -MacAddress AA-BB-CC-11-22-33 -UseOnlineApi
+```
+
 Scan a subnet:
 
 ```powershell
@@ -74,3 +80,5 @@ Invoke-Pester -Script .\tests\Network-Tools.Tests.ps1
 ## Notes
 
 This module is focused on practical network workflows. If behavior needs to be stricter for production use, the tests are already set up so changes can be validated quickly.
+
+OUI vendor mappings are stored in a separate file at data/oui-map.csv. You can provide your own map with Resolve-MacVendor -OuiMapPath.

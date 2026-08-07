@@ -1,11 +1,11 @@
 @{
     RootModule = 'Network-Tools.psm1'
-    ModuleVersion = '0.1.0'
+    ModuleVersion = '0.1.2'
     GUID = 'f8fceb5b-c4b5-4702-b622-08561fcb6b39'
     Author = 'Network Engineering Tools'
     CompanyName = 'Community'
     Copyright = '(c) Network Engineering Tools. All rights reserved.'
-    Description = 'PowerShell network engineering toolkit with CIDR conversion, traffic stimulus, host discovery, TCP port testing, and MAC vendor resolution cmdlets.'
+    Description = 'Extended PowerShell toolkit for network engineers, including CIDR conversion, traffic stimulus, host discovery, TCP port testing, and MAC vendor resolution workflows.'
     PowerShellVersion = '7.0'
 
     FunctionsToExport = @(
@@ -24,7 +24,7 @@
     VariablesToExport = '*'
     PrivateData = @{
         PSData = @{
-            Tags = @('Networking', 'CIDR', 'Ping', 'Discovery', 'TCP', 'MAC', 'OUI', 'PowerShell')
+            Tags = @('Networking', 'NetworkEngineering', 'NetworkTools', 'CIDR', 'Ping', 'Discovery', 'TCP', 'MAC', 'OUI', 'PowerShell')
         }
     }
 }
