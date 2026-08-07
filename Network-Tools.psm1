@@ -215,6 +215,118 @@ function Test-TcpPort {
     }
 }
 
+function Resolve-MacVendor {
+    <#
+    .SYNOPSIS
+    Resolves a MAC address to a likely hardware vendor based on OUI prefix.
+
+    .DESCRIPTION
+    Normalizes MAC address input and matches its OUI prefix against a built-in map.
+    You can also supply a custom CSV map file with Prefix and Vendor columns.
+
+    .PARAMETER MacAddress
+    One or more MAC addresses to resolve. Supports common formats with colons, hyphens, or dots.
+
+    .PARAMETER OuiMapPath
+    Optional path to a CSV file containing Prefix and Vendor columns.
+
+    .EXAMPLE
+    Resolve-MacVendor -MacAddress '00:1A:2B:AA:BB:CC'
+    Resolves the vendor for a single MAC address.
+
+    .EXAMPLE
+    '00-50-56-11-22-33','AA:BB:CC:00:11:22' | Resolve-MacVendor
+    Resolves vendor names for multiple MAC addresses from pipeline input.
+    #>
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory = $true, Position = 0, ValueFromPipeline = $true, ValueFromPipelineByPropertyName = $true)]
+        [Alias('MAC', 'Address')]
+        [ValidateNotNullOrEmpty()]
+        [string[]]$MacAddress,
+
+        [Parameter()]
+        [string]$OuiMapPath
+    )
+
+    begin {
+        $builtInOui = @{
+            '000C29' = 'VMware'
+            '005056' = 'VMware'
+            '00163E' = 'Xen'
+            '001A2B' = 'Cisco'
+            '001B63' = 'Apple'
+            '000D93' = 'Apple'
+            'F4CE46' = 'Ubiquiti'
+            'A44CC8' = 'Ubiquiti'
+            '3C5A37' = 'Google'
+            'B827EB' = 'Raspberry Pi Foundation'
+            'DCA632' = 'Raspberry Pi Trading'
+            'FCFBFB' = 'Microsoft'
+            'F01FAF' = 'Dell'
+            '3CD92B' = 'Hewlett Packard Enterprise'
+            '0002A5' = 'Juniper Networks'
+            'D067E5' = 'Arista Networks'
+        }
+
+        $customOui = @{}
+        if ($OuiMapPath) {
+            if (-not (Test-Path -Path $OuiMapPath)) {
+                throw "OUI map file not found: $OuiMapPath"
+            }
+
+            try {
+                $rows = Import-Csv -Path $OuiMapPath -ErrorAction Stop
+                foreach ($row in $rows) {
+                    if ($null -eq $row.Prefix -or $null -eq $row.Vendor) {
+                        continue
+                    }
+
+                    $prefix = (($row.Prefix -replace '[^0-9A-Fa-f]', '').ToUpper())
+                    if ($prefix.Length -ge 6) {
+                        $customOui[$prefix.Substring(0, 6)] = [string]$row.Vendor
+                    }
+                }
+            }
+            catch {
+                throw "Failed to read OUI map file '$OuiMapPath': $($_.Exception.Message)"
+            }
+        }
+    }
+
+    process {
+        foreach ($mac in $MacAddress) {
+            $hex = ($mac -replace '[^0-9A-Fa-f]', '').ToUpper()
+            if ($hex.Length -ne 12) {
+                throw "Invalid MAC address format: $mac"
+            }
+
+            $normalized = '{0}:{1}:{2}:{3}:{4}:{5}' -f $hex.Substring(0, 2), $hex.Substring(2, 2), $hex.Substring(4, 2), $hex.Substring(6, 2), $hex.Substring(8, 2), $hex.Substring(10, 2)
+            $prefix = $hex.Substring(0, 6)
+
+            $vendor = 'Unknown'
+            $source = 'None'
+
+            if ($customOui.ContainsKey($prefix)) {
+                $vendor = $customOui[$prefix]
+                $source = 'CustomMap'
+            }
+            elseif ($builtInOui.ContainsKey($prefix)) {
+                $vendor = $builtInOui[$prefix]
+                $source = 'BuiltInMap'
+            }
+
+            [PSCustomObject]@{
+                InputMac      = $mac
+                NormalizedMac = $normalized
+                OuiPrefix     = '{0}:{1}:{2}' -f $hex.Substring(0, 2), $hex.Substring(2, 2), $hex.Substring(4, 2)
+                Vendor        = $vendor
+                Source        = $source
+            }
+        }
+    }
+}
+
 function Convert-FromCidr {
     <#
     .SYNOPSIS
@@ -243,6 +355,12 @@ function Convert-FromCidr {
     process {
         $ip, $prefixLength = $Cidr.Split('/')
 
+        $parsedIp = $null
+        if (-not [System.Net.IPAddress]::TryParse($ip, [ref]$parsedIp) -or
+            $parsedIp.AddressFamily -ne [System.Net.Sockets.AddressFamily]::InterNetwork) {
+            throw "Invalid IPv4 address in CIDR input: $ip"
+        }
+
         $maskInt = if ([int]$prefixLength -eq 0) {
             [uint32]0
         } else {
@@ -253,7 +371,7 @@ function Convert-FromCidr {
         [array]::Reverse($maskBytes)
 
         [PSCustomObject]@{
-            IPAddress    = $ip
+            IPAddress    = $parsedIp.IPAddressToString
             PrefixLength = [int]$prefixLength
             SubnetMask   = ([ipaddress]$maskBytes).IPAddressToString
         }
@@ -278,9 +396,16 @@ function Invoke-NetworkScan {
     .PARAMETER ThrottleLimit
     Maximum number of concurrent ping operations.
 
+    .PARAMETER ResolveMacVendor
+    When set, resolves discovered MAC addresses to likely vendors using Resolve-MacVendor.
+
     .EXAMPLE
     Invoke-NetworkScan -Target 192.168.1.0/24 -TimeoutMs 300 -ThrottleLimit 50
     Scans the target subnet for reachable hosts and returns IP, MAC, and latency details.
+
+    .EXAMPLE
+    Invoke-NetworkScan -Target 192.168.1.0/24 -ResolveMacVendor
+    Scans the target subnet and includes vendor lookups for discovered MAC addresses.
     #>
     [CmdletBinding()]
     param (
@@ -289,7 +414,8 @@ function Invoke-NetworkScan {
         [string]$Target,
 
         [int]$TimeoutMs = 300,
-        [int]$ThrottleLimit = 50
+        [int]$ThrottleLimit = 50,
+        [switch]$ResolveMacVendor
     )
 
     $ipStr = ""
@@ -356,6 +482,7 @@ function Invoke-NetworkScan {
     $results = [System.Collections.Generic.List[PSCustomObject]]::new()
 
     $arpTable = Get-ArpTable
+    $vendorCache = @{}
 
     foreach ($liveHost in $liveHosts) {
         $mac = if ($arpTable.ContainsKey($liveHost.IPAddress)) {
@@ -364,9 +491,28 @@ function Invoke-NetworkScan {
             'Unknown'
         }
 
+        $vendor = $null
+        if ($ResolveMacVendor -and $mac -ne 'Unknown') {
+            if ($vendorCache.ContainsKey($mac)) {
+                $vendor = $vendorCache[$mac]
+            }
+            else {
+                try {
+                    $vendorResult = Resolve-MacVendor -MacAddress $mac -ErrorAction Stop
+                    $vendor = $vendorResult.Vendor
+                    $vendorCache[$mac] = $vendor
+                }
+                catch {
+                    $vendor = 'Unknown'
+                    $vendorCache[$mac] = $vendor
+                }
+            }
+        }
+
         $results.Add([PSCustomObject]@{
             IPAddress  = $liveHost.IPAddress
             MACAddress = $mac
+            MACVendor  = $vendor
             LatencyMs  = $liveHost.LatencyMs
         })
     }
@@ -376,4 +522,4 @@ function Invoke-NetworkScan {
 
 Set-Alias -Name Send-InterfaceStimulus -Value Send-Stimulus
 
-Export-ModuleMember -Function Send-Stimulus, Test-TcpPort, Convert-FromCidr, Invoke-NetworkScan -Alias Send-InterfaceStimulus
+Export-ModuleMember -Function Send-Stimulus, Test-TcpPort, Resolve-MacVendor, Convert-FromCidr, Invoke-NetworkScan -Alias Send-InterfaceStimulus

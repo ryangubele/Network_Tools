@@ -4,12 +4,13 @@ This is a small PowerShell module for everyday network checks and lab tasks.
 
 It is built to run cross platform on Windows and Linux with PowerShell 7.
 
-It currently includes four commands:
+It currently includes five commands:
 
 - Send-Stimulus: sends UDP broadcast traffic from a chosen local interface and source port.
 - Test-TcpPort: tests TCP connectivity to one or more ports with timeout and latency details.
+- Resolve-MacVendor: normalizes MAC addresses and maps OUI prefixes to likely vendors.
 - Convert-FromCidr: converts CIDR notation into a dotted subnet mask.
-- Invoke-NetworkScan: runs a parallel ping sweep and returns IP, MAC, and latency where available.
+- Invoke-NetworkScan: runs a parallel ping sweep and returns IP, MAC, latency, and optional MAC vendor mapping.
 
 ## Requirements
 
@@ -44,10 +45,22 @@ Test TCP ports:
 Test-TcpPort -ComputerName 192.168.1.20 -Port 22,443 -TimeoutMs 800
 ```
 
+Resolve MAC vendor:
+
+```powershell
+Resolve-MacVendor -MacAddress 00-50-56-11-22-33
+```
+
 Scan a subnet:
 
 ```powershell
 Invoke-NetworkScan -Target 192.168.1.0/24 -TimeoutMs 300 -ThrottleLimit 50
+```
+
+Scan a subnet and resolve MAC vendors:
+
+```powershell
+Invoke-NetworkScan -Target 192.168.1.0/24 -ResolveMacVendor
 ```
 
 ## Tests

@@ -44,6 +44,30 @@ Describe 'Convert-FromCidr' {
 
         $thrown | Should Be $true
     }
+
+    It 'rejects invalid IPv4 octets above 255' {
+        $thrown = $false
+        try {
+            Convert-FromCidr -Cidr '999.999.999.999/24' -ErrorAction Stop | Out-Null
+        }
+        catch {
+            $thrown = $true
+        }
+
+        $thrown | Should Be $true
+    }
+
+    It 'rejects mixed valid and invalid octets' {
+        $thrown = $false
+        try {
+            Convert-FromCidr -Cidr '256.1.1.1/24' -ErrorAction Stop | Out-Null
+        }
+        catch {
+            $thrown = $true
+        }
+
+        $thrown | Should Be $true
+    }
 }
 
 Describe 'Send-Stimulus' {
@@ -125,6 +149,21 @@ Describe 'Invoke-NetworkScan' {
         $thrown | Should Be $false
         @($result).Count | Should Be 0
     }
+
+    It 'accepts ResolveMacVendor flag without errors' {
+        $thrown = $false
+        $result = $null
+
+        try {
+            $result = Invoke-NetworkScan -Target '127.0.0.1/32' -TimeoutMs 50 -ThrottleLimit 4 -ResolveMacVendor
+        }
+        catch {
+            $thrown = $true
+        }
+
+        $thrown | Should Be $false
+        @($result).Count | Should Be 0
+    }
 }
 
 Describe 'Test-TcpPort' {
@@ -176,6 +215,55 @@ Describe 'Test-TcpPort' {
         $thrown = $false
         try {
             Test-TcpPort -ComputerName '127.0.0.1' -Port 70000 -TimeoutMs 200 -ErrorAction Stop | Out-Null
+        }
+        catch {
+            $thrown = $true
+        }
+
+        $thrown | Should Be $true
+    }
+}
+
+Describe 'Resolve-MacVendor' {
+    It 'resolves known vendor from built-in OUI map' {
+        $result = Resolve-MacVendor -MacAddress '00-50-56-11-22-33'
+
+        $result.Vendor | Should Be 'VMware'
+        $result.Source | Should Be 'BuiltInMap'
+        $result.NormalizedMac | Should Be '00:50:56:11:22:33'
+    }
+
+    It 'returns Unknown for unlisted OUI prefix' {
+        $result = Resolve-MacVendor -MacAddress 'AA-BB-CC-11-22-33'
+
+        $result.Vendor | Should Be 'Unknown'
+        $result.Source | Should Be 'None'
+    }
+
+    It 'supports custom OUI map override' {
+        $tempPath = [System.IO.Path]::GetTempFileName()
+        try {
+            @(
+                'Prefix,Vendor'
+                'AABBCC,Contoso Labs'
+            ) | Set-Content -Path $tempPath
+
+            $result = Resolve-MacVendor -MacAddress 'AA-BB-CC-00-11-22' -OuiMapPath $tempPath
+
+            $result.Vendor | Should Be 'Contoso Labs'
+            $result.Source | Should Be 'CustomMap'
+        }
+        finally {
+            if (Test-Path $tempPath) {
+                Remove-Item $tempPath -Force
+            }
+        }
+    }
+
+    It 'rejects invalid MAC address formats' {
+        $thrown = $false
+        try {
+            Resolve-MacVendor -MacAddress '00:11:22:33:44' -ErrorAction Stop | Out-Null
         }
         catch {
             $thrown = $true
