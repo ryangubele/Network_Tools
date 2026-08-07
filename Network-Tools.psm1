@@ -269,6 +269,7 @@ function Resolve-MacVendor {
 
     begin {
         $ouiMap = @{}
+        $prefixLengths = [System.Collections.Generic.HashSet[int]]::new()
         $defaultMapPath = Join-Path -Path $PSScriptRoot -ChildPath 'data\\oui-map.csv'
         $selectedMapPath = if ($OuiMapPath) { $OuiMapPath } else { $defaultMapPath }
 
@@ -285,13 +286,16 @@ function Resolve-MacVendor {
 
                 $prefix = (($row.Prefix -replace '[^0-9A-Fa-f]', '').ToUpper())
                 if ($prefix.Length -ge 6) {
-                    $ouiMap[$prefix.Substring(0, 6)] = [string]$row.Vendor
+                    $ouiMap[$prefix] = [string]$row.Vendor
+                    [void]$prefixLengths.Add($prefix.Length)
                 }
             }
         }
         catch {
             throw "Failed to read OUI map file '$selectedMapPath': $($_.Exception.Message)"
         }
+
+        $orderedPrefixLengths = $prefixLengths | Sort-Object -Descending
     }
 
     process {
@@ -307,11 +311,18 @@ function Resolve-MacVendor {
             $vendor = 'Unknown'
             $source = 'None'
 
-            if ($ouiMap.ContainsKey($prefix)) {
-                $vendor = $ouiMap[$prefix]
-                $source = if ($OuiMapPath) { 'CustomMap' } else { 'FileMap' }
+            foreach ($length in $orderedPrefixLengths) {
+                if ($length -le $hex.Length) {
+                    $candidate = $hex.Substring(0, $length)
+                    if ($ouiMap.ContainsKey($candidate)) {
+                        $vendor = $ouiMap[$candidate]
+                        $source = if ($OuiMapPath) { 'CustomMap' } else { 'FileMap' }
+                        break
+                    }
+                }
             }
-            elseif ($UseOnlineApi) {
+
+            if ($source -eq 'None' -and $UseOnlineApi) {
                 try {
                     $uri = ('{0}/{1}' -f $ApiBaseUri.TrimEnd('/'), $normalized)
                     $onlineResult = Invoke-RestMethod -Uri $uri -Method Get -TimeoutSec 5 -ErrorAction Stop

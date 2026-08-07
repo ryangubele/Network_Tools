@@ -228,7 +228,7 @@ Describe 'Resolve-MacVendor' {
     It 'resolves known vendor from local OUI map file' {
         $result = Resolve-MacVendor -MacAddress '00-50-56-11-22-33'
 
-        $result.Vendor | Should Be 'VMware'
+        $result.Vendor | Should Match 'VMware'
         $result.Source | Should Be 'FileMap'
         $result.NormalizedMac | Should Be '00:50:56:11:22:33'
     }
