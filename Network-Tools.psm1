@@ -35,6 +35,56 @@ function Get-ArpTable {
     return $arpTable
 }
 
+if ($null -eq $script:OuiLookupCache) {
+    $script:OuiLookupCache = @{}
+}
+
+function Get-OuiLookupData {
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory = $true)]
+        [string]$MapPath
+    )
+
+    $resolvedPath = [System.IO.Path]::GetFullPath($MapPath)
+    if (-not (Test-Path -Path $resolvedPath)) {
+        throw "OUI map file not found: $resolvedPath"
+    }
+
+    $lastWriteTicks = (Get-Item -Path $resolvedPath).LastWriteTimeUtc.Ticks
+    if ($script:OuiLookupCache.ContainsKey($resolvedPath)) {
+        $cached = $script:OuiLookupCache[$resolvedPath]
+        if ($cached.LastWriteTicks -eq $lastWriteTicks) {
+            return $cached
+        }
+    }
+
+    $ouiMap = @{}
+    $prefixLengths = [System.Collections.Generic.HashSet[int]]::new()
+
+    $rows = Import-Csv -Path $resolvedPath -ErrorAction Stop
+    foreach ($row in $rows) {
+        if ($null -eq $row.Prefix -or $null -eq $row.Vendor) {
+            continue
+        }
+
+        $prefix = (($row.Prefix -replace '[^0-9A-Fa-f]', '').ToUpper())
+        if ($prefix.Length -ge 6) {
+            $ouiMap[$prefix] = [string]$row.Vendor
+            [void]$prefixLengths.Add($prefix.Length)
+        }
+    }
+
+    $cacheEntry = [PSCustomObject]@{
+        Map                = $ouiMap
+        OrderedPrefixLengths = ($prefixLengths | Sort-Object -Descending)
+        LastWriteTicks     = $lastWriteTicks
+    }
+
+    $script:OuiLookupCache[$resolvedPath] = $cacheEntry
+    return $cacheEntry
+}
+
 function Send-Stimulus {
     <#
     .SYNOPSIS
@@ -268,34 +318,18 @@ function Resolve-MacVendor {
     )
 
     begin {
-        $ouiMap = @{}
-        $prefixLengths = [System.Collections.Generic.HashSet[int]]::new()
         $defaultMapPath = Join-Path -Path $PSScriptRoot -ChildPath 'data\\oui-map.csv'
         $selectedMapPath = if ($OuiMapPath) { $OuiMapPath } else { $defaultMapPath }
 
-        if (-not (Test-Path -Path $selectedMapPath)) {
-            throw "OUI map file not found: $selectedMapPath"
-        }
-
         try {
-            $rows = Import-Csv -Path $selectedMapPath -ErrorAction Stop
-            foreach ($row in $rows) {
-                if ($null -eq $row.Prefix -or $null -eq $row.Vendor) {
-                    continue
-                }
-
-                $prefix = (($row.Prefix -replace '[^0-9A-Fa-f]', '').ToUpper())
-                if ($prefix.Length -ge 6) {
-                    $ouiMap[$prefix] = [string]$row.Vendor
-                    [void]$prefixLengths.Add($prefix.Length)
-                }
-            }
+            $lookupData = Get-OuiLookupData -MapPath $selectedMapPath
         }
         catch {
             throw "Failed to read OUI map file '$selectedMapPath': $($_.Exception.Message)"
         }
 
-        $orderedPrefixLengths = $prefixLengths | Sort-Object -Descending
+        $ouiMap = $lookupData.Map
+        $orderedPrefixLengths = $lookupData.OrderedPrefixLengths
     }
 
     process {
@@ -406,6 +440,7 @@ function Invoke-NetworkScan {
     .DESCRIPTION
     Accepts CIDR (e.g., 192.168.1.0/24) or standard mask (e.g., 192.168.1.0 255.255.255.0).
     Requires PowerShell 7+ for the ForEach-Object -Parallel switch.
+    Emits result objects as hosts are discovered instead of waiting for full scan completion.
 
     .PARAMETER Target
     Target network expressed as CIDR (192.168.1.0/24) or address plus subnet mask.
@@ -481,63 +516,81 @@ function Invoke-NetworkScan {
 
     Write-Verbose "Pinging $($ipList.Count) IPs..."
 
-    $liveHosts = $ipList | ForEach-Object -Parallel {
-        $ping = [System.Net.NetworkInformation.Ping]::new()
-        try {
-            $reply = $ping.Send($_, $using:TimeoutMs)
-            if ($reply.Status -eq 'Success') {
-                [PSCustomObject]@{
-                    IPAddress = $_
-                    LatencyMs = $reply.RoundtripTime
-                }
-            }
-        }
-        catch {
-        }
-        finally {
-            $ping.Dispose()
-        }
-    } -ThrottleLimit $ThrottleLimit
-
-    $results = [System.Collections.Generic.List[PSCustomObject]]::new()
-
     $arpTable = Get-ArpTable
     $vendorCache = @{}
+    $ouiMap = $null
+    $orderedPrefixLengths = @()
 
-    foreach ($liveHost in $liveHosts) {
-        $mac = if ($arpTable.ContainsKey($liveHost.IPAddress)) {
-            $arpTable[$liveHost.IPAddress]
-        } else {
-            'Unknown'
+    if ($ResolveMacVendor) {
+        try {
+            $lookupData = Get-OuiLookupData -MapPath (Join-Path -Path $PSScriptRoot -ChildPath 'data\\oui-map.csv')
+            $ouiMap = $lookupData.Map
+            $orderedPrefixLengths = $lookupData.OrderedPrefixLengths
         }
-
-        $vendor = $null
-        if ($ResolveMacVendor -and $mac -ne 'Unknown') {
-            if ($vendorCache.ContainsKey($mac)) {
-                $vendor = $vendorCache[$mac]
-            }
-            else {
-                try {
-                    $vendorResult = Resolve-MacVendor -MacAddress $mac -ErrorAction Stop
-                    $vendor = $vendorResult.Vendor
-                    $vendorCache[$mac] = $vendor
-                }
-                catch {
-                    $vendor = 'Unknown'
-                    $vendorCache[$mac] = $vendor
-                }
-            }
+        catch {
+            Write-Verbose "OUI map load failed. MAC vendor lookup will fall back to Unknown."
         }
-
-        $results.Add([PSCustomObject]@{
-            IPAddress  = $liveHost.IPAddress
-            MACAddress = $mac
-            MACVendor  = $vendor
-            LatencyMs  = $liveHost.LatencyMs
-        })
     }
 
-    return $results
+    $ipList |
+        ForEach-Object -Parallel {
+            $ping = [System.Net.NetworkInformation.Ping]::new()
+            try {
+                $reply = $ping.Send($_, $using:TimeoutMs)
+                if ($reply.Status -eq 'Success') {
+                    [PSCustomObject]@{
+                        IPAddress = $_
+                        LatencyMs = $reply.RoundtripTime
+                    }
+                }
+            }
+            catch {
+            }
+            finally {
+                $ping.Dispose()
+            }
+        } -ThrottleLimit $ThrottleLimit |
+        ForEach-Object {
+            $mac = if ($arpTable.ContainsKey($_.IPAddress)) {
+                $arpTable[$_.IPAddress]
+            } else {
+                'Unknown'
+            }
+
+            $vendor = $null
+            if ($ResolveMacVendor -and $mac -ne 'Unknown') {
+                if ($vendorCache.ContainsKey($mac)) {
+                    $vendor = $vendorCache[$mac]
+                }
+                else {
+                    $vendor = 'Unknown'
+                    if ($null -ne $ouiMap) {
+                        $macHex = ($mac -replace '[^0-9A-Fa-f]', '').ToUpper()
+                        foreach ($length in $orderedPrefixLengths) {
+                            if ($length -le $macHex.Length) {
+                                $candidate = $macHex.Substring(0, $length)
+                                if ($ouiMap.ContainsKey($candidate)) {
+                                    $vendor = $ouiMap[$candidate]
+                                    break
+                                }
+                            }
+                        }
+                    }
+
+                    $vendorCache[$mac] = $vendor
+                }
+            }
+
+            $scanResult = [PSCustomObject]@{
+                IPAddress  = $_.IPAddress
+                MACAddress = $mac
+                MACVendor  = $vendor
+                LatencyMs  = $_.LatencyMs
+            }
+
+            $scanResult.PSObject.TypeNames.Insert(0, 'NetworkTools.ScanResult')
+            $scanResult
+        }
 }
 
 Set-Alias -Name Send-InterfaceStimulus -Value Send-Stimulus

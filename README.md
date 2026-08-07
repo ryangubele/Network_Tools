@@ -12,6 +12,8 @@ It currently includes five commands:
 - Convert-FromCidr: converts CIDR notation into a dotted subnet mask.
 - Invoke-NetworkScan: runs a parallel ping sweep and returns IP, MAC, latency, and optional MAC vendor mapping.
 
+Invoke-NetworkScan now emits result objects as hosts are discovered, so output appears live during the scan.
+
 ## Requirements
 
 - PowerShell 7+

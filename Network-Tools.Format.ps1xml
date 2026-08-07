@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Configuration>
+  <ViewDefinitions>
+    <View>
+      <Name>NetworkToolsScanResultTable</Name>
+      <ViewSelectedBy>
+        <TypeName>NetworkTools.ScanResult</TypeName>
+      </ViewSelectedBy>
+      <TableControl>
+        <AutoSize />
+        <TableHeaders>
+          <TableColumnHeader>
+            <Label>IPAddress</Label>
+            <Width>15</Width>
+          </TableColumnHeader>
+          <TableColumnHeader>
+            <Label>MACAddress</Label>
+            <Width>17</Width>
+          </TableColumnHeader>
+          <TableColumnHeader>
+            <Label>MACVendor</Label>
+            <Width>40</Width>
+          </TableColumnHeader>
+          <TableColumnHeader>
+            <Label>LatencyMs</Label>
+            <Width>9</Width>
+          </TableColumnHeader>
+        </TableHeaders>
+        <TableRowEntries>
+          <TableRowEntry>
+            <TableColumnItems>
+              <TableColumnItem>
+                <PropertyName>IPAddress</PropertyName>
+              </TableColumnItem>
+              <TableColumnItem>
+                <PropertyName>MACAddress</PropertyName>
+              </TableColumnItem>
+              <TableColumnItem>
+                <PropertyName>MACVendor</PropertyName>
+              </TableColumnItem>
+              <TableColumnItem>
+                <PropertyName>LatencyMs</PropertyName>
+              </TableColumnItem>
+            </TableColumnItems>
+          </TableRowEntry>
+        </TableRowEntries>
+      </TableControl>
+    </View>
+  </ViewDefinitions>
+</Configuration>
