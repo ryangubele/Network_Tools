@@ -164,6 +164,56 @@ Describe 'Invoke-NetworkScan' {
         $thrown | Should Be $false
         @($result).Count | Should Be 0
     }
+
+    It 'accepts ResolveDns flag without errors' {
+        $thrown = $false
+        $result = $null
+
+        try {
+            $result = Invoke-NetworkScan -Target '127.0.0.1/32' -TimeoutMs 50 -ThrottleLimit 4 -ResolveDns
+        }
+        catch {
+            $thrown = $true
+        }
+
+        $thrown | Should Be $false
+        @($result).Count | Should Be 0
+    }
+
+    It 'accepts DnsTimeout in seconds without errors' {
+        $thrown = $false
+        $result = $null
+
+        try {
+            $result = Invoke-NetworkScan -Target '127.0.0.1/32' -TimeoutMs 50 -ThrottleLimit 4 -ResolveDns -DnsTimeout 10
+        }
+        catch {
+            $thrown = $true
+        }
+
+        $thrown | Should Be $false
+        @($result).Count | Should Be 0
+    }
+
+    It 'emits ScanResult objects carrying a Hostname property' {
+        $result = Invoke-NetworkScan -Target '127.0.0.1/30' -TimeoutMs 100 -ThrottleLimit 4 -ResolveDns
+
+        $hosts = @($result)
+        $hosts.Count | Should BeGreaterThan 0
+        foreach ($h in $hosts) {
+            $h.PSObject.TypeNames[0] | Should Be 'NetworkTools.ScanResult'
+            $h.PSObject.Properties.Name -contains 'Hostname' | Should Be $true
+        }
+    }
+
+    It 'leaves Hostname null when ResolveDns is not specified' {
+        $result = Invoke-NetworkScan -Target '127.0.0.1/30' -TimeoutMs 100 -ThrottleLimit 4
+
+        foreach ($h in @($result)) {
+            $h.PSObject.Properties.Name -contains 'Hostname' | Should Be $true
+            $h.Hostname | Should BeNullOrEmpty
+        }
+    }
 }
 
 Describe 'Test-TcpPort' {

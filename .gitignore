@@ -1,3 +1,6 @@
 # Local publish helpers and secrets
 publish-local.ps1
 scripts/publish-local.ps1
+
+# Agent instructions
+AGENTS.md
