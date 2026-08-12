@@ -22,6 +22,10 @@
             <Width>40</Width>
           </TableColumnHeader>
           <TableColumnHeader>
+            <Label>Hostname</Label>
+            <Width>30</Width>
+          </TableColumnHeader>
+          <TableColumnHeader>
             <Label>LatencyMs</Label>
             <Width>9</Width>
           </TableColumnHeader>
@@ -37,6 +41,9 @@
               </TableColumnItem>
               <TableColumnItem>
                 <PropertyName>MACVendor</PropertyName>
+              </TableColumnItem>
+              <TableColumnItem>
+                <PropertyName>Hostname</PropertyName>
               </TableColumnItem>
               <TableColumnItem>
                 <PropertyName>LatencyMs</PropertyName>

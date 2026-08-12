@@ -454,6 +454,12 @@ function Invoke-NetworkScan {
     .PARAMETER ResolveMacVendor
     When set, resolves discovered MAC addresses to likely vendors using Resolve-MacVendor.
 
+    .PARAMETER ResolveDns
+    When set, performs a reverse DNS (PTR) lookup for each discovered host and includes its hostname.
+
+    .PARAMETER DnsTimeout
+    Timeout in seconds for each reverse DNS lookup. Increase if hostnames are being missed on slow DNS.
+
     .EXAMPLE
     Invoke-NetworkScan -Target 192.168.1.0/24 -TimeoutMs 300 -ThrottleLimit 50
     Scans the target subnet for reachable hosts and returns IP, MAC, and latency details.
@@ -470,7 +476,9 @@ function Invoke-NetworkScan {
 
         [int]$TimeoutMs = 300,
         [int]$ThrottleLimit = 50,
-        [switch]$ResolveMacVendor
+        [int]$DnsTimeout = 5,
+        [switch]$ResolveMacVendor,
+        [switch]$ResolveDns
     )
 
     $ipStr = ""
@@ -558,8 +566,7 @@ function Invoke-NetworkScan {
             }
 
             $vendor = $null
-            if ($ResolveMacVendor -and $mac -ne 'Unknown') {
-                if ($vendorCache.ContainsKey($mac)) {
+            if ($ResolveMacVendor -and $mac -ne 'Unknown') {                if ($vendorCache.ContainsKey($mac)) {
                     $vendor = $vendorCache[$mac]
                 }
                 else {
@@ -581,16 +588,32 @@ function Invoke-NetworkScan {
                 }
             }
 
-            $scanResult = [PSCustomObject]@{
+            [PSCustomObject]@{
                 IPAddress  = $_.IPAddress
                 MACAddress = $mac
                 MACVendor  = $vendor
+                Hostname   = $null
                 LatencyMs  = $_.LatencyMs
             }
-
-            $scanResult.PSObject.TypeNames.Insert(0, 'NetworkTools.ScanResult')
-            $scanResult
-        }
+        } |
+        ForEach-Object -Parallel {
+            if ($using:ResolveDns) {
+                $dnsTimeout = $using:DnsTimeout * 1000
+                try {
+                    $result = [System.Net.Dns]::BeginGetHostEntry($_.IPAddress, $null, $null)
+                    if ($result.AsyncWaitHandle.WaitOne($dnsTimeout)) {
+                        $entry = [System.Net.Dns]::EndGetHostEntry($result)
+                        if ($null -ne $entry -and -not [string]::IsNullOrWhiteSpace($entry.HostName)) {
+                            $_.Hostname = $entry.HostName
+                        }
+                    }
+                }
+                catch {
+                }
+            }
+            $_.PSObject.TypeNames.Insert(0, 'NetworkTools.ScanResult')
+            $_
+        } -ThrottleLimit $ThrottleLimit
 }
 
 Set-Alias -Name Send-InterfaceStimulus -Value Send-Stimulus
