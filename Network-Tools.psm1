@@ -565,8 +565,20 @@ function Invoke-NetworkScan {
                 'Unknown'
             }
 
+            if ($mac -eq 'Unknown') {
+                foreach ($retry in 1..3) {
+                    Start-Sleep -Milliseconds 100
+                    $freshArp = Get-ArpTable
+                    if ($freshArp.ContainsKey($_.IPAddress)) {
+                        $mac = $freshArp[$_.IPAddress]
+                        break
+                    }
+                }
+            }
+
             $vendor = $null
-            if ($ResolveMacVendor -and $mac -ne 'Unknown') {                if ($vendorCache.ContainsKey($mac)) {
+            if ($ResolveMacVendor -and $mac -ne 'Unknown') {
+                if ($vendorCache.ContainsKey($mac)) {
                     $vendor = $vendorCache[$mac]
                 }
                 else {
@@ -589,10 +601,10 @@ function Invoke-NetworkScan {
             }
 
             [PSCustomObject]@{
+                Hostname   = $null
                 IPAddress  = $_.IPAddress
                 MACAddress = $mac
                 MACVendor  = $vendor
-                Hostname   = $null
                 LatencyMs  = $_.LatencyMs
             }
         } |

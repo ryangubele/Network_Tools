@@ -10,6 +10,10 @@
         <AutoSize />
         <TableHeaders>
           <TableColumnHeader>
+            <Label>Hostname</Label>
+            <Width>30</Width>
+          </TableColumnHeader>
+          <TableColumnHeader>
             <Label>IPAddress</Label>
             <Width>15</Width>
           </TableColumnHeader>
@@ -22,10 +26,6 @@
             <Width>40</Width>
           </TableColumnHeader>
           <TableColumnHeader>
-            <Label>Hostname</Label>
-            <Width>30</Width>
-          </TableColumnHeader>
-          <TableColumnHeader>
             <Label>LatencyMs</Label>
             <Width>9</Width>
           </TableColumnHeader>
@@ -34,6 +34,9 @@
           <TableRowEntry>
             <TableColumnItems>
               <TableColumnItem>
+                <PropertyName>Hostname</PropertyName>
+              </TableColumnItem>
+              <TableColumnItem>
                 <PropertyName>IPAddress</PropertyName>
               </TableColumnItem>
               <TableColumnItem>
@@ -41,9 +44,6 @@
               </TableColumnItem>
               <TableColumnItem>
                 <PropertyName>MACVendor</PropertyName>
-              </TableColumnItem>
-              <TableColumnItem>
-                <PropertyName>Hostname</PropertyName>
               </TableColumnItem>
               <TableColumnItem>
                 <PropertyName>LatencyMs</PropertyName>

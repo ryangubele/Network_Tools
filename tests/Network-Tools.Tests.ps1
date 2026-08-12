@@ -206,6 +206,46 @@ Describe 'Invoke-NetworkScan' {
         }
     }
 
+    It 'retries ARP lookup when the first snapshot is empty' {
+        InModuleScope Network-Tools {
+            Mock Get-ArpTable {
+                if ($script:arpSnapshotCallCount -eq $null) {
+                    $script:arpSnapshotCallCount = 0
+                }
+
+                $script:arpSnapshotCallCount++
+                if ($script:arpSnapshotCallCount -eq 1) {
+                    @{}
+                }
+                else {
+                    @{ '127.0.0.1' = '00:11:22:33:44:55' }
+                }
+            }
+
+            Mock Get-OuiLookupData {
+                [pscustomobject]@{
+                    Map = @{ '001122' = 'Contoso Ltd' }
+                    OrderedPrefixLengths = @(6)
+                }
+            }
+        }
+
+        $result = Invoke-NetworkScan -Target '127.0.0.1/30' -TimeoutMs 100 -ThrottleLimit 4 -ResolveMacVendor
+
+        $hostResult = @($result) | Where-Object { $_.IPAddress -eq '127.0.0.1' }
+        $hostResult.Count | Should BeGreaterThan 0
+        $hostResult[0].MACAddress | Should Be '00:11:22:33:44:55'
+        $hostResult[0].MACVendor | Should Be 'Contoso Ltd'
+    }
+
+    It 'places Hostname before IPAddress in the object property order' {
+        $result = Invoke-NetworkScan -Target '127.0.0.1/30' -TimeoutMs 100 -ThrottleLimit 4 -ResolveDns
+
+        $names = @($result[0].PSObject.Properties.Name)
+        $names[0] | Should Be 'Hostname'
+        $names[1] | Should Be 'IPAddress'
+    }
+
     It 'leaves Hostname null when ResolveDns is not specified' {
         $result = Invoke-NetworkScan -Target '127.0.0.1/30' -TimeoutMs 100 -ThrottleLimit 4
 
