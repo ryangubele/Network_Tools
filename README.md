@@ -4,13 +4,15 @@ This is a small PowerShell module for everyday network checks and lab tasks.
 
 It is built to run cross platform on Windows and Linux with PowerShell 7.
 
-It currently includes five commands:
+It currently includes seven commands:
 
 - Send-Stimulus: sends UDP broadcast traffic from a chosen local interface and source port.
 - Test-TcpPort: tests TCP connectivity to one or more ports with timeout and latency details.
 - Resolve-MacVendor: normalizes MAC addresses and maps OUI prefixes to likely vendors.
 - Convert-FromCidr: converts CIDR notation into a dotted subnet mask.
 - Invoke-NetworkScan: runs a parallel ping sweep and returns IP, MAC, latency, and optional MAC vendor mapping.
+- Get-SnmpInterface: reads interface inventory plus traffic, error, and discard counters over SNMP v1/v2c/v3, optionally sampling rates.
+- Invoke-BandwidthMonitor (alias Invoke-BwMon): a live, htop-style SNMP bandwidth and error-counter monitor for every interface on a device.
 
 Invoke-NetworkScan now emits result objects as hosts are discovered, so output appears live during the scan.
 
@@ -69,6 +71,97 @@ Scan a subnet and resolve MAC vendors:
 
 ```powershell
 Invoke-NetworkScan -Target 192.168.1.0/24 -ResolveMacVendor
+```
+
+## SNMP bandwidth and error monitoring
+
+Watch every interface on a switch live (SNMPv2c):
+
+```powershell
+Invoke-BwMon 10.0.0.1 -V2c -Community public
+```
+
+The default **grid** view packs one meter per interface into as many columns as it takes to fit the whole switch on one screen. A 52-port switch fits in two columns on a 30-line terminal and in three columns at 80×24.
+
+Inbound traffic (green) grows from the left edge of each meter toward the centre, and outbound traffic (red) grows from the right edge toward the centre. Both are scaled to the interface speed, so the edges are 0 and the centre is line rate. The port name sits in the middle with compact rates beside it:
+
+```
+[██▓                    70Mb Gi1/0/1 198Mb       ▓███████] [█░                     34Mb Gi1/0/27 93Mb          ▓███]
+[██████████████████████859Mb Gi1/0/3 253Mb     ▓█████████] [                          Gi1/0/28                     ]
+[░                     8.9Mb Gi1/0/5 265Mb     ░█████████] [████████████████████▒  511Mb Gi1/0/30 81Mb         ░███]
+```
+
+Long names are abbreviated (`GigabitEthernet` becomes `Gi`, `TenGigabitEthernet` becomes `Te`, and so on). If a name still doesn't fit, its start is cut off so the distinguishing end stays visible (`…ink-ae12`). Use `-NameTruncation End` or the `n` key to keep the start instead.
+
+A meter's brackets turn yellow when the port has errors or discards, and red while they are increasing.
+
+Press `v` to cycle through the views:
+- **Grid**: bandwidth meters, as above.
+- **Errors**: the same grid, showing `in errors/discards  port  out errors/discards`.
+- **List**: one wide row per interface, with alias, speed, full rates and separate error columns.
+
+Error counts show the device's totals by default. Press `e` (or start with `-ErrorsSinceStart`) to count only from when the monitor started.
+
+The monitor polls every 0.5 s by default. Rates are measured between the polls at which a counter actually changed, then averaged over the last 3 seconds (`-AverageSeconds`, or the `a` key). `-AverageSeconds 0` turns averaging off, and the header shows `avg off`; each rate then covers only the latest counter refresh. Many agents refresh their counters only every second or so (RouterOS) or every few seconds (many switches). Without this, fast polling would flicker between 0 and double the real rate. Raise `-IntervalSeconds` on switches with weak management CPUs.
+
+Ports that are down stay in their positions, shown dimmed. Virtual interfaces that are down are hidden until you press `d`. Partial cells use shaded blocks (`░ ▒ ▓`). Use `-BarStyle Ascii` for `| % #` on terminals without block glyphs.
+
+Keys:
+
+| Key | Action |
+|---|---|
+| `q` | Quit |
+| `v` | Cycle views: grid, errors, list |
+| `s` | Cycle sort: index, name, in, out, total, errors |
+| `l` | Toggle log scale |
+| `a` | Cycle averaging: off, 1, 3, 5, 10, 30 s |
+| `+` / `-` | Change poll interval |
+| `d` | Show every interface |
+| `e` | Error totals or since start |
+| `n` | Keep the start or end of long names |
+| `r` | Reset since-start counts |
+| Arrows, PgUp/PgDn | Scroll |
+
+Interfaces are discovered from IF-MIB, and only those with readable in/out octet counters are shown. 64-bit `ifHC*` counters are used where available (v2c/v3), with a fallback to 32-bit counters, including wrap handling.
+
+SNMPv3 (USM) with authentication and privacy:
+
+```powershell
+$auth = Read-Host -AsSecureString 'Auth password'
+$priv = Read-Host -AsSecureString 'Priv password'
+Invoke-BwMon core1 -V3 -UserName monitor -AuthProtocol SHA256 -AuthPassword $auth -PrivProtocol AES -PrivPassword $priv
+```
+
+- Auth protocols: MD5, SHA (SHA-1), SHA256, SHA384, SHA512.
+- Privacy protocols: DES, AES (128), AES192/AES256 (Blumenthal key extension, net-snmp `AES192`/`AES256`), and AES192C/AES256C (Reeder key extension, used by Cisco).
+- Omitting `-PrivPassword` gives authNoPriv. Passwords can be strings or SecureStrings.
+- Verified against MikroTik RouterOS 7.25.1 over v2c and over v3 authPriv (SHA256/AES). Other combinations are tested against the RFC 3414 key test vectors and the loopback test agent.
+
+Limit the view to some interfaces (by index, name, description, or alias; wildcards are allowed):
+
+```powershell
+Invoke-BwMon 10.0.0.1 -Community public -Interface 'Te1/1/*', 'Po*' -IntervalSeconds 5
+```
+
+Scripted counters, for example to find ports that are taking errors:
+
+```powershell
+Get-SnmpInterface 10.0.0.1 -Community public | Where-Object { $_.InErrors -gt 0 -or $_.OutErrors -gt 0 }
+```
+
+Sample rates and error deltas over 10 seconds:
+
+```powershell
+Get-SnmpInterface 10.0.0.1 -Community public -SampleSeconds 10 | Sort-Object InBitsPerSec -Descending
+```
+
+To try the monitor without a device, the tests include a loopback SNMP agent:
+
+```powershell
+. .\tests\SnmpTestAgent.ps1
+$agent = Start-SnmpTestAgent -ModulePath .\Network-Tools.psm1 -Mib (New-SnmpTestMib -InterfaceCount 8)
+Invoke-BwMon 127.0.0.1 -Port $agent.Port
+Stop-SnmpTestAgent $agent
 ```
 
 ## Tests

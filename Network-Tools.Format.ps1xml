@@ -53,5 +53,44 @@
         </TableRowEntries>
       </TableControl>
     </View>
+    <View>
+      <Name>NetworkToolsSnmpInterfaceTable</Name>
+      <ViewSelectedBy>
+        <TypeName>NetworkTools.SnmpInterface</TypeName>
+      </ViewSelectedBy>
+      <TableControl>
+        <AutoSize />
+        <TableHeaders>
+          <TableColumnHeader><Label>Index</Label></TableColumnHeader>
+          <TableColumnHeader><Label>Name</Label></TableColumnHeader>
+          <TableColumnHeader><Label>Alias</Label></TableColumnHeader>
+          <TableColumnHeader><Label>Status</Label></TableColumnHeader>
+          <TableColumnHeader><Label>SpeedMbps</Label></TableColumnHeader>
+          <TableColumnHeader><Label>InRate</Label></TableColumnHeader>
+          <TableColumnHeader><Label>OutRate</Label></TableColumnHeader>
+          <TableColumnHeader><Label>InErrors</Label></TableColumnHeader>
+          <TableColumnHeader><Label>OutErrors</Label></TableColumnHeader>
+          <TableColumnHeader><Label>InDiscards</Label></TableColumnHeader>
+          <TableColumnHeader><Label>OutDiscards</Label></TableColumnHeader>
+        </TableHeaders>
+        <TableRowEntries>
+          <TableRowEntry>
+            <TableColumnItems>
+              <TableColumnItem><PropertyName>Index</PropertyName></TableColumnItem>
+              <TableColumnItem><PropertyName>Name</PropertyName></TableColumnItem>
+              <TableColumnItem><PropertyName>Alias</PropertyName></TableColumnItem>
+              <TableColumnItem><PropertyName>OperStatus</PropertyName></TableColumnItem>
+              <TableColumnItem><PropertyName>SpeedMbps</PropertyName></TableColumnItem>
+              <TableColumnItem><PropertyName>InRate</PropertyName></TableColumnItem>
+              <TableColumnItem><PropertyName>OutRate</PropertyName></TableColumnItem>
+              <TableColumnItem><PropertyName>InErrors</PropertyName></TableColumnItem>
+              <TableColumnItem><PropertyName>OutErrors</PropertyName></TableColumnItem>
+              <TableColumnItem><PropertyName>InDiscards</PropertyName></TableColumnItem>
+              <TableColumnItem><PropertyName>OutDiscards</PropertyName></TableColumnItem>
+            </TableColumnItems>
+          </TableRowEntry>
+        </TableRowEntries>
+      </TableControl>
+    </View>
   </ViewDefinitions>
 </Configuration>
