@@ -20,6 +20,19 @@ function New-SnmpTestMib {
     & $add '1.3.6.1.2.1.1.1.0' 'OctetString' 'Network-Tools loopback test agent'
     & $add '1.3.6.1.2.1.1.3.0' 'TimeTicks' 1234567 100
     & $add '1.3.6.1.2.1.1.5.0' 'OctetString' 'test-agent'
+    & $add '1.3.6.1.2.1.1.6.0' 'OctetString' 'lab rack 3'
+
+    # HOST-RESOURCES-MIB: two CPUs, 256 MiB of RAM half used, plus a disk entry to skip.
+    & $add '1.3.6.1.2.1.25.3.3.1.2.1' 'Integer' 12
+    & $add '1.3.6.1.2.1.25.3.3.1.2.2' 'Integer' 35
+    & $add '1.3.6.1.2.1.25.2.3.1.2.65536' 'ObjectIdentifier' '1.3.6.1.2.1.25.2.1.2'
+    & $add '1.3.6.1.2.1.25.2.3.1.2.131072' 'ObjectIdentifier' '1.3.6.1.2.1.25.2.1.4'
+    & $add '1.3.6.1.2.1.25.2.3.1.4.65536' 'Integer' 1024
+    & $add '1.3.6.1.2.1.25.2.3.1.4.131072' 'Integer' 1024
+    & $add '1.3.6.1.2.1.25.2.3.1.5.65536' 'Integer' 262144
+    & $add '1.3.6.1.2.1.25.2.3.1.5.131072' 'Integer' 16384
+    & $add '1.3.6.1.2.1.25.2.3.1.6.65536' 'Integer' 131072
+    & $add '1.3.6.1.2.1.25.2.3.1.6.131072' 'Integer' 9000
 
     for ($i = 1; $i -le $InterfaceCount; $i++) {
         $inRate = 1250000 * $i      # 10 Mbps per interface number

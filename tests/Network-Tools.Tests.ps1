@@ -657,6 +657,58 @@ Describe 'Bandwidth monitor state' {
             $state.IntervalSeconds | Should Be 0.25
             Invoke-BandwidthMonitorKey -State $state -Key (& $key 'q' ([System.ConsoleKey]::Q)) | Should Be $false
         }
+
+        It 'records link changes and shows them in the header' {
+            $state = & $newState
+            Update-BandwidthMonitorState -State $state -Sample (& $sample 10.0 1000 (& $counters 0 0 0))
+            $down = & $counters 0 0 0
+            $down.OperStatus = 2
+            Update-BandwidthMonitorState -State $state -Sample (& $sample 11.0 1100 $down)
+
+            $state.Rows[0].LinkChangedAt | Should Be 11.0
+            $state.Events[-1].Text | Should Be 'GigabitEthernet1/0/1 down'
+            $state.Now = 23.0
+            (Format-BandwidthMonitorFrame -State $state -Width 200 -Height 8 -NoColor)[1] | Should Match 'GigabitEthernet1/0/1 down 12s ago'
+        }
+
+        It 'alerts on ports whose errors are increasing' {
+            $state = & $newState
+            Update-BandwidthMonitorState -State $state -Sample (& $sample 10.0 1000 (& $counters 0 0 50))
+            Update-BandwidthMonitorState -State $state -Sample (& $sample 11.0 1100 (& $counters 0 0 60))
+            Update-BandwidthMonitorState -State $state -Sample (& $sample 12.0 1200 (& $counters 0 0 65))
+
+            $header = (Format-BandwidthMonitorFrame -State $state -Width 200 -Height 8 -NoColor)[1]
+            $header | Should Match 'GigabitEthernet1/0/1 \+15'
+            $header | Should Match 'err/disc in 65/0 out 0/0'
+            $state.Now = 30.0
+            (Format-BandwidthMonitorFrame -State $state -Width 200 -Height 8 -NoColor)[1] | Should Not Match '\+15'
+        }
+
+        It 'flags an agent restart and stale data' {
+            $state = & $newState
+            Update-BandwidthMonitorState -State $state -Sample (& $sample 10.0 5000 (& $counters 0 0 0))
+            Update-BandwidthMonitorState -State $state -Sample (& $sample 11.0 10 (& $counters 0 0 0))
+            (Format-BandwidthMonitorFrame -State $state -Width 200 -Height 8 -NoColor)[1] | Should Match 'agent restarted'
+            $state.Now = 30.0
+            (Format-BandwidthMonitorFrame -State $state -Width 200 -Height 8 -NoColor)[0] | Should Match 'STALE 19s'
+        }
+
+        It 'shows CPU and memory and keeps the header inside narrow terminals' {
+            $state = & $newState
+            $state.CpuLoads = @(10.0, 90.0)
+            $state.MemUsedBytes = 128MB
+            $state.MemTotalBytes = 256MB
+            Update-BandwidthMonitorState -State $state -Sample (& $sample 10.0 1000 (& $counters 0 0 0))
+
+            $wide = Format-BandwidthMonitorFrame -State $state -Width 220 -Height 8 -NoColor
+            $wide[1] | Should Match 'CPU \[.*\] +50%'
+            $wide[1] | Should Match 'Mem \[.*\] +50% 128M/256M'
+            foreach ($width in 60, 80, 120) {
+                foreach ($line in (Format-BandwidthMonitorFrame -State $state -Width $width -Height 8 -NoColor)[0..1]) {
+                    $line.Length | Should BeLessThan $width
+                }
+            }
+        }
     }
 }
 
@@ -739,6 +791,27 @@ Describe 'Get-SnmpInterface' {
             $result = @(Get-SnmpInterface 127.0.0.1 -Port $agent.Port -V1)
             $result.Count | Should Be 4
             @($result | Where-Object HighCapacity).Count | Should Be 0
+        }
+
+        It 'reads CPU, memory and location for the monitor header' {
+            $result = & (Get-Module Network-Tools) {
+                param ($Port)
+                $session = New-SnmpSession -ComputerName 127.0.0.1 -Port $Port
+                try {
+                    $inventory = Get-SnmpInterfaceInventory -Session $session -IncludeHostResources
+                    $sample = Get-SnmpInterfaceSample -Session $session -Interfaces $inventory.Interfaces -HostResources $inventory.HostResources
+                    [PSCustomObject]@{ Inventory = $inventory; Sample = $sample }
+                }
+                finally {
+                    Close-SnmpSession $session
+                }
+            } $agent.Port
+
+            $result.Inventory.SysLocation | Should Be 'lab rack 3'
+            ($result.Inventory.HostResources.CpuIndexes -join ',') | Should Be '1,2'
+            $result.Inventory.HostResources.Ram.TotalBytes | Should Be 268435456
+            ($result.Sample.CpuLoads -join ',') | Should Be '12,35'
+            $result.Sample.MemUsedBytes | Should Be 134217728
         }
 
         It 'reports a timeout for a wrong community' {

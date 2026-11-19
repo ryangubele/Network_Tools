@@ -2026,6 +2026,7 @@ $script:IfMib = @{
     SysDescr     = '1.3.6.1.2.1.1.1.0'
     SysUpTime    = '1.3.6.1.2.1.1.3.0'
     SysName      = '1.3.6.1.2.1.1.5.0'
+    SysLocation  = '1.3.6.1.2.1.1.6.0'
     IfDescr      = '1.3.6.1.2.1.2.2.1.2'
     IfType       = '1.3.6.1.2.1.2.2.1.3'
     IfSpeed      = '1.3.6.1.2.1.2.2.1.5'
@@ -2042,6 +2043,13 @@ $script:IfMib = @{
     HCOutOctets  = '1.3.6.1.2.1.31.1.1.1.10'
     IfHighSpeed  = '1.3.6.1.2.1.31.1.1.1.15'
     IfAlias      = '1.3.6.1.2.1.31.1.1.1.18'
+    # HOST-RESOURCES-MIB
+    HrProcessorLoad = '1.3.6.1.2.1.25.3.3.1.2'
+    HrStorageType   = '1.3.6.1.2.1.25.2.3.1.2'
+    HrStorageUnits  = '1.3.6.1.2.1.25.2.3.1.4'
+    HrStorageSize   = '1.3.6.1.2.1.25.2.3.1.5'
+    HrStorageUsed   = '1.3.6.1.2.1.25.2.3.1.6'
+    HrStorageRam    = '1.3.6.1.2.1.25.2.1.2'
 }
 
 $script:IfStatusNames = @{
@@ -2084,10 +2092,44 @@ function Get-SnmpColumn {
     return $map
 }
 
-function Get-SnmpInterfaceInventory {
+function Get-SnmpHostResources {
+    # HOST-RESOURCES-MIB: per-CPU load (hrProcessorLoad) and the RAM entry of hrStorageTable.
+    # Returns $null when the agent exposes neither, so callers can simply skip CPU/memory.
     param ([hashtable]$Session)
 
-    $system = Invoke-SnmpGet -Session $Session -Oid @($script:IfMib.SysDescr, $script:IfMib.SysUpTime, $script:IfMib.SysName)
+    $cpuIndexes = @()
+    $ram = $null
+    try {
+        $cpuIndexes = @((Get-SnmpColumn -Session $Session -ColumnOid $script:IfMib.HrProcessorLoad).Keys | Sort-Object)
+        $storageTypes = Get-SnmpColumn -Session $Session -ColumnOid $script:IfMib.HrStorageType
+        $ramIndex = @($storageTypes.Keys | Where-Object { $storageTypes[$_] -eq $script:IfMib.HrStorageRam } | Sort-Object | Select-Object -First 1)
+        if ($ramIndex.Count -gt 0) {
+            $i = $ramIndex[0]
+            $values = Invoke-SnmpGet -Session $Session -Oid @("$($script:IfMib.HrStorageUnits).$i", "$($script:IfMib.HrStorageSize).$i")
+            $units = Get-SnmpNumericValue $values["$($script:IfMib.HrStorageUnits).$i"]
+            $size = Get-SnmpNumericValue $values["$($script:IfMib.HrStorageSize).$i"]
+            if ($units -gt 0 -and $size -gt 0) {
+                $ram = [PSCustomObject]@{ Index = $i; Units = [double]$units; TotalBytes = [double]$units * [double]$size }
+            }
+        }
+    }
+    catch {
+        Write-Verbose "HOST-RESOURCES-MIB unavailable: $($_.Exception.Message)"
+    }
+
+    if ($cpuIndexes.Count -eq 0 -and $null -eq $ram) {
+        return $null
+    }
+    [PSCustomObject]@{
+        CpuIndexes = $cpuIndexes
+        Ram        = $ram
+    }
+}
+
+function Get-SnmpInterfaceInventory {
+    param ([hashtable]$Session, [switch]$IncludeHostResources)
+
+    $system = Invoke-SnmpGet -Session $Session -Oid @($script:IfMib.SysDescr, $script:IfMib.SysUpTime, $script:IfMib.SysName, $script:IfMib.SysLocation)
 
     $descr = Get-SnmpColumn -Session $Session -ColumnOid $script:IfMib.IfDescr
     $type = Get-SnmpColumn -Session $Session -ColumnOid $script:IfMib.IfType
@@ -2138,10 +2180,12 @@ function Get-SnmpInterfaceInventory {
     }
 
     [PSCustomObject]@{
-        SysName    = ConvertTo-SnmpDisplayString $system[$script:IfMib.SysName].Value
-        SysDescr   = ConvertTo-SnmpDisplayString $system[$script:IfMib.SysDescr].Value
-        SysUpTime  = $system[$script:IfMib.SysUpTime].Value
-        Interfaces = @($interfaces)
+        SysName       = ConvertTo-SnmpDisplayString $system[$script:IfMib.SysName].Value
+        SysDescr      = ConvertTo-SnmpDisplayString $system[$script:IfMib.SysDescr].Value
+        SysLocation   = ConvertTo-SnmpDisplayString $system[$script:IfMib.SysLocation].Value
+        SysUpTime     = $system[$script:IfMib.SysUpTime].Value
+        HostResources = if ($IncludeHostResources) { Get-SnmpHostResources -Session $Session } else { $null }
+        Interfaces    = @($interfaces)
     }
 }
 
@@ -2155,10 +2199,18 @@ function Get-SnmpNumericValue {
 }
 
 function Get-SnmpInterfaceSample {
-    param ([hashtable]$Session, [object[]]$Interfaces)
+    param ([hashtable]$Session, [object[]]$Interfaces, $HostResources)
 
     $oids = [System.Collections.Generic.List[string]]::new()
     $oids.Add($script:IfMib.SysUpTime)
+    if ($null -ne $HostResources) {
+        foreach ($cpu in $HostResources.CpuIndexes) {
+            $oids.Add("$($script:IfMib.HrProcessorLoad).$cpu")
+        }
+        if ($HostResources.Ram) {
+            $oids.Add("$($script:IfMib.HrStorageUsed).$($HostResources.Ram.Index)")
+        }
+    }
     foreach ($interface in $Interfaces) {
         $i = $interface.Index
         if ($interface.HighCapacity) {
@@ -2194,10 +2246,25 @@ function Get-SnmpInterfaceSample {
         }
     }
 
+    $cpuLoads = $null
+    $memUsedBytes = $null
+    if ($null -ne $HostResources) {
+        $cpuLoads = @(foreach ($cpu in $HostResources.CpuIndexes) {
+            $load = Get-SnmpNumericValue $values["$($script:IfMib.HrProcessorLoad).$cpu"]
+            if ($null -ne $load) { [double]$load }
+        })
+        if ($HostResources.Ram) {
+            $used = Get-SnmpNumericValue $values["$($script:IfMib.HrStorageUsed).$($HostResources.Ram.Index)"]
+            if ($null -ne $used) { $memUsedBytes = [double]$used * $HostResources.Ram.Units }
+        }
+    }
+
     [PSCustomObject]@{
-        Time     = $time
-        UpTime   = Get-SnmpNumericValue $values[$script:IfMib.SysUpTime]
-        Counters = $counters
+        Time         = $time
+        UpTime       = Get-SnmpNumericValue $values[$script:IfMib.SysUpTime]
+        CpuLoads     = $cpuLoads
+        MemUsedBytes = $memUsedBytes
+        Counters     = $counters
     }
 }
 
@@ -2309,6 +2376,10 @@ $script:BandwidthIntervalSteps = @(0.2, 0.25, 0.5, 1, 2, 5, 10, 30, 60)
 $script:BandwidthAverageSteps = @(0, 1, 3, 5, 10, 30)
 $script:BandwidthErrorFields = @('InErrors', 'OutErrors', 'InDiscards', 'OutDiscards')
 $script:BandwidthFlashSeconds = 3.0
+# How long error bursts and link changes stay in the header (and link-changed labels stay magenta).
+$script:BandwidthAlertSeconds = 10.0
+$script:BandwidthLinkAlertSeconds = 300.0
+$script:BandwidthLinkHighlightSeconds = 60.0
 
 # ethernetCsmacd, fastEther, fastEtherFX, gigabitEthernet: kept on screen even when down so a
 # switch's front-panel ports hold their positions in the grid.
@@ -2673,6 +2744,12 @@ function New-BandwidthMonitorRow {
         TotalOutDiscards = $null
         # Field -> time until which the cell is highlighted after the counter increased.
         ErrorFlash       = @{}
+        # Errors+discards added during the current burst (reset once the port goes quiet).
+        ErrorBurst       = [uint64]0
+        ErrorBurstUntil  = 0.0
+        # Monitor-clock time of the last oper-status change seen while monitoring.
+        LinkChangedAt    = $null
+        LinkChanges      = 0
     }
 }
 
@@ -2682,17 +2759,45 @@ function Update-BandwidthMonitorState {
     $previous = $State.LastSample
     $State.LastSample = $Sample
     $State.Now = $Sample.Time
+    $State.LastSuccess = $Sample.Time
     if ($null -ne $Sample.UpTime) {
         $State.UpTime = $Sample.UpTime
     }
+    if ($null -ne $Sample.CpuLoads) {
+        $State.CpuLoads = $Sample.CpuLoads
+    }
+    if ($null -ne $Sample.MemUsedBytes) {
+        $State.MemUsedBytes = $Sample.MemUsedBytes
+    }
+    if ($null -eq $State.Events) {
+        $State.Events = [System.Collections.Generic.List[object]]::new()
+    }
+    $addEvent = {
+        param ([string]$Text, [string]$Kind)
+        $State.Events.Add([PSCustomObject]@{ Time = $Sample.Time; Text = $Text; Kind = $Kind })
+        while ($State.Events.Count -gt 100) { $State.Events.RemoveAt(0) }
+    }
+
     # sysUpTime going backwards means the agent restarted and its counters reset.
     $restarted = $null -ne $previous -and $null -ne $Sample.UpTime -and $null -ne $previous.UpTime -and $Sample.UpTime -lt $previous.UpTime
+    if ($restarted) {
+        & $addEvent 'agent restarted (counters reset)' 'Restart'
+    }
     $average = [double]($State.AverageSeconds ?? 3)
 
     foreach ($row in $State.Rows) {
         $current = $Sample.Counters[$row.Index]
         if ($null -eq $current) { continue }
-        if ($null -ne $current.OperStatus) { $row.OperStatus = [int]$current.OperStatus }
+        if ($null -ne $current.OperStatus) {
+            $status = [int]$current.OperStatus
+            if ($null -ne $previous -and $status -ne $row.OperStatus) {
+                $row.LinkChangedAt = $Sample.Time
+                $row.LinkChanges++
+                $label = if ($status -eq 1) { 'up' } else { $script:IfStatusNames[$status] ?? 'down' }
+                & $addEvent "$($row.Name) $label" $(if ($status -eq 1) { 'LinkUp' } else { 'LinkDown' })
+            }
+            $row.OperStatus = $status
+        }
 
         if ($restarted) {
             $row.InTracker = @{}
@@ -2713,6 +2818,9 @@ function Update-BandwidthMonitorState {
                 if ($delta) {
                     $row.$field = [uint64]($row.$field + $delta)
                     $row.ErrorFlash[$field] = $Sample.Time + $script:BandwidthFlashSeconds
+                    # Header alert: running total for this burst, kept while errors keep arriving.
+                    $row.ErrorBurst = if ($row.ErrorBurstUntil -gt $Sample.Time) { [uint64]($row.ErrorBurst + $delta) } else { [uint64]$delta }
+                    $row.ErrorBurstUntil = $Sample.Time + $script:BandwidthAlertSeconds
                 }
             }
         }
@@ -2800,7 +2908,8 @@ function Format-BandwidthGridCell {
     }
     $flashing = Test-BandwidthFlash $Row $script:BandwidthErrorFields $now
     $bracketCode = if ($flashing) { '1;91' } elseif ($hasErrors) { '33' } elseif ($isUp) { '1' } else { '2' }
-    $labelCode = if ($isUp) { '1' } else { '2' }
+    $linkChanged = $null -ne $Row.LinkChangedAt -and ($now - $Row.LinkChangedAt) -lt $script:BandwidthLinkHighlightSeconds
+    $labelCode = if ($linkChanged) { '1;95' } elseif ($isUp) { '1' } else { '2' }
 
     if ($Errors) {
         $severity = {
@@ -3008,6 +3117,253 @@ function Format-BandwidthMonitorList {
     return , $lines.ToArray()
 }
 
+function New-BandwidthPart {
+    param ([string]$Text, [string]$Code = '')
+
+    [PSCustomObject]@{ Text = $Text; Code = $Code }
+}
+
+function New-BandwidthSegment {
+    # One header item made of coloured parts. On narrow terminals segments with the highest
+    # Priority number are dropped first.
+    param ([object[]]$Parts, [double]$Priority = 5)
+
+    [PSCustomObject]@{
+        Parts    = $Parts
+        Priority = $Priority
+        Length   = [int](($Parts | ForEach-Object { $_.Text.Length } | Measure-Object -Sum).Sum)
+    }
+}
+
+function Join-BandwidthHeader {
+    # Lays out header segments on one line of $Width visible characters (one space of padding at
+    # each end): left segments from the left, right segments flush right. Segments are admitted
+    # in priority order and admission stops at the first one that does not fit, so a less
+    # important item never displaces a more important one.
+    param (
+        [object[]]$Left = @(),
+        [object[]]$Right = @(),
+        [int]$Width,
+        [string]$BaseCode = '',
+        [string]$Separator = '  ',
+        [switch]$NoColor
+    )
+
+    $inner = [Math]::Max(0, $Width - 2)
+    $all = @($Left) + @($Right)
+    $order = @{}
+    for ($i = 0; $i -lt $all.Count; $i++) { $order[$all[$i]] = $i }
+    $kept = [System.Collections.Generic.HashSet[object]]::new()
+    $used = 0
+    foreach ($segment in ($all | Sort-Object -Property Priority, @{ Expression = { $order[$_] } })) {
+        $extra = $segment.Length + $(if ($kept.Count -gt 0) { $Separator.Length } else { 0 })
+        if ($used + $extra -gt $inner) {
+            break
+        }
+        [void]$kept.Add($segment)
+        $used += $extra
+    }
+
+    $escape = [char]27
+    $render = {
+        param ([object[]]$Segments)
+        $builder = [System.Text.StringBuilder]::new()
+        $visible = 0
+        $first = $true
+        foreach ($segment in $Segments) {
+            if (-not $kept.Contains($segment)) { continue }
+            if (-not $first) {
+                if (-not $NoColor) { [void]$builder.Append("$escape[0;$(if ($BaseCode) { $BaseCode } else { '0' })m") }
+                [void]$builder.Append($Separator)
+                $visible += $Separator.Length
+            }
+            $first = $false
+            foreach ($part in $segment.Parts) {
+                if (-not $NoColor) {
+                    $code = (@($BaseCode, $part.Code) | Where-Object { $_ }) -join ';'
+                    [void]$builder.Append("$escape[0;$(if ($code) { $code } else { '0' })m")
+                }
+                [void]$builder.Append($part.Text)
+                $visible += $part.Text.Length
+            }
+        }
+        [PSCustomObject]@{ Text = $builder.ToString(); Length = $visible }
+    }
+
+    $leftText = & $render $Left
+    $rightText = & $render $Right
+    $gap = [Math]::Max(0, $inner - $leftText.Length - $rightText.Length)
+    $base = if ($NoColor) { '' } else { "$escape[0;$(if ($BaseCode) { $BaseCode } else { '0' })m" }
+    $end = if ($NoColor) { '' } else { "$escape[0m" }
+    return $base + ' ' + $leftText.Text + $base + (' ' * $gap) + $rightText.Text + $base + ' ' + $end
+}
+
+function Get-BandwidthLoadCode {
+    param ([double]$Percent)
+
+    if ($Percent -ge 85) { return '1;31' }
+    if ($Percent -ge 60) { return '33' }
+    return '32'
+}
+
+function New-BandwidthMeterSegment {
+    # htop-style meter: "CPU [▓▓░       ] 12%" with an optional suffix.
+    param ([string]$Label, [double]$Percent, [int]$Width = 10, [object[]]$Suffix = @(), [double]$Priority = 5)
+
+    $Percent = [Math]::Max(0.0, [Math]::Min(100.0, $Percent))
+    $glyphs = $script:BandwidthBarGlyphs['Block']
+    $levels = $glyphs.Count - 1
+    $units = [int][Math]::Round($Percent / 100 * $Width * $levels)
+    if ($Percent -gt 0 -and $units -eq 0) { $units = 1 }
+    $bar = -join @(for ($cell = 0; $cell -lt $Width; $cell++) {
+        $glyphs[[Math]::Max(0, [Math]::Min($levels, $units - $cell * $levels))]
+    })
+    $parts = @(
+        (New-BandwidthPart "$Label " '1')
+        (New-BandwidthPart '[')
+        (New-BandwidthPart $bar (Get-BandwidthLoadCode $Percent))
+        (New-BandwidthPart (']{0,4}' -f ('{0:0}%' -f $Percent)))
+    ) + @($Suffix)
+    return New-BandwidthSegment -Parts $parts -Priority $Priority
+}
+
+function Format-SnmpBytes {
+    param ([double]$Bytes)
+
+    $units = 'B', 'K', 'M', 'G', 'T'
+    $unit = 0
+    while ($Bytes -ge 1024 -and $unit -lt 4) {
+        $Bytes /= 1024
+        $unit++
+    }
+    $number = if ($Bytes -lt 9.95 -and $unit -gt 0) { '{0:0.#}' -f $Bytes } else { '{0:0}' -f $Bytes }
+    return "$number$($units[$unit])"
+}
+
+function Format-BandwidthAge {
+    param ([double]$Seconds)
+
+    if ($Seconds -lt 90) { return '{0:0}s' -f [Math]::Max(0, $Seconds) }
+    if ($Seconds -lt 5400) { return '{0:0}m' -f ($Seconds / 60) }
+    return '{0:0}h' -f ($Seconds / 3600)
+}
+
+function Get-BandwidthMonitorHeader {
+    # Two header lines, built for someone working an incident:
+    #   1. which device this is and whether the data can be trusted (uptime, poll health), with
+    #      the current view settings on the right;
+    #   2. what is happening right now: CPU/memory, aggregate port throughput, ports up, error and
+    #      discard totals, then live alerts (ports taking errors, link changes, agent restarts).
+    param ([hashtable]$State, [int]$Width, [switch]$NoColor)
+
+    $now = [double]$State.Now
+    $totals = [bool]$State.ShowTotals
+
+    # Line 1: identity and data health.
+    $name = if ($State.SysName) { $State.SysName } else { $State.Target }
+    $left = [System.Collections.Generic.List[object]]::new()
+    $left.Add((New-BandwidthSegment -Parts @(New-BandwidthPart $name '1') -Priority 1))
+    if ($State.SysName -and $State.SysName -ne $State.Target) {
+        $left.Add((New-BandwidthSegment -Parts @(New-BandwidthPart $State.Target) -Priority 3))
+    }
+    $descr = (($State.SysDescr ?? '') -split '\r?\n')[0].Trim()
+    if ($descr) {
+        if ($descr.Length -gt 48) { $descr = $descr.Substring(0, 47) + [char]0x2026 }
+        $left.Add((New-BandwidthSegment -Parts @(New-BandwidthPart $descr) -Priority 7))
+    }
+    if ($State.SysLocation) {
+        $left.Add((New-BandwidthSegment -Parts @(New-BandwidthPart "@ $($State.SysLocation)") -Priority 8))
+    }
+    $upSeconds = if ($null -ne $State.UpTime) { [double]$State.UpTime / 100 } else { $null }
+    # A short uptime during an incident usually means the box just rebooted.
+    $upCode = if ($null -ne $upSeconds -and $upSeconds -lt 3600) { '1;97;41' } elseif ($null -ne $upSeconds -and $upSeconds -lt 86400) { '30;43' } else { '' }
+    $left.Add((New-BandwidthSegment -Parts @(New-BandwidthPart "up $(Format-SnmpUpTime $State.UpTime)" $upCode) -Priority 2))
+    $left.Add((New-BandwidthSegment -Parts @(New-BandwidthPart $State.VersionLabel) -Priority 6))
+    $lastGood = $State.LastSuccess
+    $staleAfter = 3 * [double]$State.IntervalSeconds + 2
+    if ($null -ne $lastGood -and ($now - $lastGood) -gt $staleAfter) {
+        $pollPart = New-BandwidthPart " STALE $(Format-BandwidthAge ($now - $lastGood)) " '1;97;41'
+    } elseif ($State.LastError) {
+        $pollPart = New-BandwidthPart ' poll failing ' '1;97;41'
+    } else {
+        $pollPart = New-BandwidthPart "poll $($State.PollMs)ms"
+    }
+    $left.Add((New-BandwidthSegment -Parts @($pollPart) -Priority 2))
+
+    $averageLabel = if ($State.AverageSeconds -gt 0) { "avg $($State.AverageSeconds)s" } else { 'avg off' }
+    $right = @(
+        (New-BandwidthSegment -Parts @(New-BandwidthPart ($State.View ?? 'Grid').ToLowerInvariant() '1') -Priority 9)
+        (New-BandwidthSegment -Parts @(New-BandwidthPart "$($State.IntervalSeconds)s $averageLabel") -Priority 9)
+        (New-BandwidthSegment -Parts @(New-BandwidthPart "sort $($State.Sort.ToLowerInvariant())") -Priority 10)
+        (New-BandwidthSegment -Parts @(New-BandwidthPart $(if ($State.LogScale) { 'log' } else { 'linear' })) -Priority 11)
+        (New-BandwidthSegment -Parts @(New-BandwidthPart $(if ($totals) { 'err totals' } else { 'err since start' })) -Priority 10)
+    )
+    $line1 = Join-BandwidthHeader -Left $left -Right $right -Width $Width -BaseCode '30;46' -NoColor:$NoColor
+
+    # Line 2: live state.
+    $items = [System.Collections.Generic.List[object]]::new()
+    $loads = @($State.CpuLoads)
+    if ($loads.Count -gt 0) {
+        $average = ($loads | Measure-Object -Average).Average
+        $suffix = @()
+        if ($loads.Count -gt 1 -and $loads.Count -le 16) {
+            # Per-core sparkline so one pegged core is visible behind a calm average.
+            $suffix = @(New-BandwidthPart ' ')
+            foreach ($load in $loads) {
+                $level = [Math]::Min(7, [int][Math]::Floor([Math]::Max(0, $load) / 12.5))
+                $suffix += New-BandwidthPart ([string][char](0x2581 + $level)) (Get-BandwidthLoadCode $load)
+            }
+        }
+        $items.Add((New-BandwidthMeterSegment -Label 'CPU' -Percent $average -Suffix $suffix -Priority 5))
+    }
+    if ($null -ne $State.MemUsedBytes -and $State.MemTotalBytes -gt 0) {
+        $percent = 100.0 * $State.MemUsedBytes / $State.MemTotalBytes
+        $suffix = @(New-BandwidthPart " $(Format-SnmpBytes $State.MemUsedBytes)/$(Format-SnmpBytes $State.MemTotalBytes)")
+        $items.Add((New-BandwidthMeterSegment -Label 'Mem' -Percent $percent -Suffix $suffix -Priority 6))
+    }
+
+    # Aggregate throughput over physical ports (summing bridges/VLANs/tunnels would double count),
+    # falling back to every interface on devices that report no physical ports.
+    $physical = @($State.Rows | Where-Object Physical)
+    $pool = if ($physical.Count -gt 0) { $physical } else { @($State.Rows) }
+    $poolLabel = if ($physical.Count -gt 0) { 'ports' } else { 'ifaces' }
+    $sumIn = [double](($pool | ForEach-Object { [double]($_.InBps ?? 0) } | Measure-Object -Sum).Sum)
+    $sumOut = [double](($pool | ForEach-Object { [double]($_.OutBps ?? 0) } | Measure-Object -Sum).Sum)
+    $items.Add((New-BandwidthSegment -Priority 3 -Parts @(
+        (New-BandwidthPart "$([char]0x03A3) in ")
+        (New-BandwidthPart (Format-SnmpBitRateShort $sumIn) '1;92')
+        (New-BandwidthPart ' out ')
+        (New-BandwidthPart (Format-SnmpBitRateShort $sumOut) '1;91')
+    )))
+    $up = @($pool | Where-Object { $_.OperStatus -eq 1 }).Count
+    $items.Add((New-BandwidthSegment -Parts @(New-BandwidthPart "$poolLabel up $up/$($pool.Count)") -Priority 4))
+
+    $sum = @{}
+    foreach ($field in $script:BandwidthErrorFields) {
+        $sum[$field] = [double](($State.Rows | ForEach-Object { [double]((Get-BandwidthErrorValue $_ $field $totals) ?? 0) } | Measure-Object -Sum).Sum)
+    }
+    $anyErrors = ($sum.Values | Measure-Object -Sum).Sum -gt 0
+    $errorText = "err/disc in $(Format-SnmpCount $sum.InErrors)/$(Format-SnmpCount $sum.InDiscards) out $(Format-SnmpCount $sum.OutErrors)/$(Format-SnmpCount $sum.OutDiscards)"
+    $items.Add((New-BandwidthSegment -Parts @(New-BandwidthPart $errorText $(if ($anyErrors) { '33' } else { '2' })) -Priority 2))
+
+    # Alerts, most urgent first: ports taking errors right now, then recent link/agent events.
+    $alertPriority = 1.0
+    $bursting = @($State.Rows | Where-Object { $_.ErrorBurstUntil -gt $now } | Sort-Object -Property ErrorBurst -Descending)
+    foreach ($row in $bursting) {
+        $items.Add((New-BandwidthSegment -Parts @(New-BandwidthPart "$([char]0x25B2) $($row.Name) +$(Format-SnmpCount $row.ErrorBurst)" '1;91') -Priority $alertPriority))
+        $alertPriority += 0.01
+    }
+    $recent = @($State.Events | Where-Object { ($now - $_.Time) -lt $script:BandwidthLinkAlertSeconds } | Sort-Object -Property Time -Descending)
+    foreach ($entry in $recent) {
+        $code = if ($entry.Kind -in 'LinkUp', 'LinkDown') { '1;95' } else { '1;91' }
+        $items.Add((New-BandwidthSegment -Parts @(New-BandwidthPart "$([char]0x21C5) $($entry.Text) $(Format-BandwidthAge ($now - $entry.Time)) ago" $code) -Priority $alertPriority))
+        $alertPriority += 0.01
+    }
+    $line2 = Join-BandwidthHeader -Left $items -Width $Width -NoColor:$NoColor
+
+    return , [string[]]@($line1, $line2)
+}
+
 function Format-BandwidthMonitorFrame {
     # Returns the screen as an array of lines (ANSI-coloured unless -NoColor), each at most $Width-1 visible chars.
     param ([hashtable]$State, [int]$Width, [int]$Height, [switch]$NoColor)
@@ -3022,22 +3378,9 @@ function Format-BandwidthMonitorFrame {
     $view = $State.View ?? 'Grid'
 
     $lines = [System.Collections.Generic.List[string]]::new()
-
-    $sysLabel = if ($State.SysName) { "$($State.Target) ($($State.SysName))" } else { $State.Target }
-    $scaleLabel = if ($State.LogScale) { 'log' } else { 'linear' }
-    $errorLabel = if ($State.ShowTotals) { 'errors: totals' } else { 'errors: since start' }
-    $averageLabel = if ($State.AverageSeconds -gt 0) { "avg $($State.AverageSeconds)s" } else { 'avg off' }
-    $title = " bwmon | $sysLabel | $($State.VersionLabel) | up $(Format-SnmpUpTime $State.UpTime) | $($view.ToLowerInvariant()) | every $($State.IntervalSeconds)s $averageLabel | $scaleLabel | sort $($State.Sort.ToLowerInvariant()) | $errorLabel | $($rows.Count)/$($State.Rows.Count) ifaces"
-    $lines.Add((& $sgr '30;46') + (Get-SnmpFitText $title $usable) + $reset)
-
-    $legend = switch ($view) {
-        'Errors' { 'cells: in errors/discards  port  out errors/discards  (yellow = non-zero, red = increased in the last few seconds)' }
-        'Grid' { 'bars: in (green) from the left edge, out (red) from the right edge, centre = link speed  |  [ ] yellow = port has errors, red = errors increasing' }
-        default { '' }
+    foreach ($line in (Get-BandwidthMonitorHeader -State $State -Width $usable -NoColor:$NoColor)) {
+        $lines.Add($line)
     }
-    $descr = (($State.SysDescr ?? '') -split '\r?\n')[0]
-    $second = if ($legend) { " $descr  |  $legend" } else { " $descr" }
-    $lines.Add((& $sgr '2') + (Get-SnmpFitText $second $usable) + $reset)
 
     $footerLines = if ($State.LastError) { 2 } else { 1 }
     $bodyHeight = [Math]::Max(1, $Height - $lines.Count - $footerLines)
@@ -3059,11 +3402,10 @@ function Format-BandwidthMonitorFrame {
     if ($State.LastError) {
         $lines.Add((& $sgr '1;91') + (Get-SnmpFitText (' ! ' + $State.LastError) $usable) + $reset)
     }
-    $totalIn = ($rows | ForEach-Object { $_.InBps ?? 0 } | Measure-Object -Sum).Sum
-    $totalOut = ($rows | ForEach-Object { $_.OutBps ?? 0 } | Measure-Object -Sum).Sum
-    $more = if ($State.ScrollInfo) { " | $($State.ScrollInfo)" } else { '' }
-    $footer = " total in $(Format-SnmpBitRate $totalIn) out $(Format-SnmpBitRate $totalOut) | poll $($State.PollMs) ms$more | q quit  v view  s sort  l log  a avg  +/- rate  d all  e err totals  n names  r reset  arrows scroll"
-    $lines.Add((& $sgr '7') + (Get-SnmpFitText $footer $usable) + $reset)
+    $keys = ' q quit  v view  s sort  l log  a avg  +/- rate  d all  e totals  n names  r reset'
+    $more = if ($State.ScrollInfo) { "$($State.ScrollInfo) " } else { '' }
+    $gap = [Math]::Max(1, $usable - $keys.Length - $more.Length)
+    $lines.Add((& $sgr '7') + (Get-SnmpFitText ($keys + (' ' * $gap) + $more) $usable) + $reset)
 
     return , $lines.ToArray()
 }
@@ -3330,10 +3672,23 @@ function Invoke-BandwidthMonitor {
     (green) grows from the left edge toward the centre and outbound (red) from the right edge
     toward the centre, scaled to the interface speed. The port name is centred in the meter with
     compact rates (5Kb, 8.3Mb, 1Gb) beside it. A meter's brackets turn yellow when the port has
-    errors/discards and red while they are increasing.
+    errors/discards and red while they are increasing. A port's name turns magenta for a minute
+    after its link state changes.
 
     Errors view: the same grid showing in and out errors/discards per port.
     List view: one wide row per interface with alias, speed, full rates and error columns.
+
+    Header line 1: device name, address, model/OS, uptime, SNMP version and poll latency, with the
+    current view settings on the right. Uptime is red under an hour (likely reboot) and yellow
+    under a day. The poll field turns red ("poll failing", or "STALE" with the age of the last good
+    sample) when the data on screen can no longer be trusted.
+
+    Header line 2: CPU (average, plus a per-core sparkline) and memory from HOST-RESOURCES-MIB
+    when the device provides them, total throughput across physical ports, ports up, total
+    errors/discards (in/out), then live alerts: ports whose errors are increasing with the count
+    added in the current burst, link up/down changes from the last five minutes, and agent
+    restarts. On narrow terminals the least important items are dropped first; alerts are kept
+    the longest.
 
     Rates are measured between the polls at which each counter actually changed and averaged
     over -AverageSeconds, so fast polling against agents that refresh counters about once a
@@ -3484,17 +3839,24 @@ function Invoke-BandwidthMonitor {
 
     try {
         Write-Host "Discovering interfaces on $ComputerName ($($session.VersionLabel))..."
-        $inventory = Get-SnmpInterfaceInventory -Session $session
+        $inventory = Get-SnmpInterfaceInventory -Session $session -IncludeHostResources
         $interfaces = @($inventory.Interfaces | Where-Object { Test-SnmpInterfaceMatch -Interface $_ -Pattern $Interface })
         if ($interfaces.Count -eq 0) {
             throw "No interfaces with readable octet counters on $ComputerName matched."
         }
+        $hostResources = $inventory.HostResources
 
         $state = @{
             Target          = $ComputerName
             SysName         = $inventory.SysName
             SysDescr        = $inventory.SysDescr
+            SysLocation     = $inventory.SysLocation
             UpTime          = $inventory.SysUpTime
+            CpuLoads        = $null
+            MemUsedBytes    = $null
+            MemTotalBytes   = $hostResources.Ram.TotalBytes
+            Events          = [System.Collections.Generic.List[object]]::new()
+            LastSuccess     = $null
             VersionLabel    = $session.VersionLabel
             IntervalSeconds = $IntervalSeconds
             AverageSeconds  = $AverageSeconds
@@ -3519,7 +3881,7 @@ function Invoke-BandwidthMonitor {
         $poll = {
             $watch = [System.Diagnostics.Stopwatch]::StartNew()
             try {
-                $sample = Get-SnmpInterfaceSample -Session $session -Interfaces $interfaces
+                $sample = Get-SnmpInterfaceSample -Session $session -Interfaces $interfaces -HostResources $hostResources
                 Update-BandwidthMonitorState -State $state -Sample $sample
                 $state.LastError = $null
             }

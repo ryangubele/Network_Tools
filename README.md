@@ -93,7 +93,24 @@ Inbound traffic (green) grows from the left edge of each meter toward the centre
 
 Long names are abbreviated (`GigabitEthernet` becomes `Gi`, `TenGigabitEthernet` becomes `Te`, and so on). If a name still doesn't fit, its start is cut off so the distinguishing end stays visible (`…ink-ae12`). Use `-NameTruncation End` or the `n` key to keep the start instead.
 
-A meter's brackets turn yellow when the port has errors or discards, and red while they are increasing.
+A meter's brackets turn yellow when the port has errors or discards, and red while they are increasing. A port's name turns magenta for a minute after its link goes up or down.
+
+The two header lines are built for working an incident:
+
+```
+ lab-edge  192.0.2.10  Example 24-port switch  up 6d 01:02:39  v2c  poll 120ms        grid  0.5s avg 3s  sort index
+ CPU [▓         ]  8% ▁▁▁▁  Σ in 78Kb out 218Kb  ports up 3/5  err/disc in 0/0 out 47466/4345  ▲ vpn +138  ⇅ ether4 down 12s ago
+```
+
+- **Line 1, device and data health.**
+  - Name, address, model, uptime, SNMP version and poll latency.
+  - Uptime turns red under an hour (a likely reboot) and yellow under a day.
+  - The poll field turns red (`poll failing`, or `STALE 12s`) when the screen can no longer be trusted.
+- **Line 2, what is happening now.**
+  - CPU and memory from HOST-RESOURCES-MIB, when the device provides them. The sparkline shows each core.
+  - Total throughput across physical ports, ports up, and total errors/discards.
+  - Live alerts: ports whose errors are climbing (with the count added in the current burst), link changes from the last five minutes, and agent restarts.
+- **Narrow terminals** drop the least important items first. Alerts stay the longest.
 
 Press `v` to cycle through the views:
 - **Grid**: bandwidth meters, as above.
