@@ -88,6 +88,8 @@ function Start-SnmpTestAgent {
         [int]$MaxBulkVarbinds = 64,
         [ValidateRange(64, 65000)]
         [int]$MaxBulkBytes = 4096,
+        [ValidateRange(0, 5000)]
+        [int]$ResponseDelayMs = 0,
         [int]$Port = 0
     )
 
@@ -99,6 +101,7 @@ function Start-SnmpTestAgent {
         MaxResponseVarbinds = $MaxResponseVarbinds
         MaxBulkVarbinds     = $MaxBulkVarbinds
         MaxBulkBytes        = $MaxBulkBytes
+        ResponseDelayMs     = $ResponseDelayMs
     }
 
     $agentScript = {
@@ -174,9 +177,7 @@ function Start-SnmpTestAgent {
                         }
                     }
                 } elseif ($pdu.PduType -eq 0xA5) {
-                    # Bounded GetBulk: at most MaxBulkVarbinds bindings and MaxBulkBytes encoded,
-                    # and generation stops once every repeater has reached the end of the MIB, so
-                    # a request's max-repetitions cannot make the agent build a huge reply.
+                    # Limit GetBulk work and keep at least one binding so a walk can progress.
                     $limit = [Math]::Max(1, $Options.MaxBulkVarbinds)
                     $nonRepeaters = [Math]::Min([Math]::Max(0, $pdu.ErrorStatus), $requested.Count)
                     $repetitions = [Math]::Max(1, $pdu.ErrorIndex)
@@ -202,7 +203,8 @@ function Start-SnmpTestAgent {
                         }
                     }
                     while ($out.Count -gt 1 -and (ConvertTo-SnmpVarbindListTlv -Varbinds @($out)).Length -gt $Options.MaxBulkBytes) {
-                        $out.RemoveRange([Math]::Max(1, [int]($out.Count * 0.8)), $out.Count - [Math]::Max(1, [int]($out.Count * 0.8)))
+                        $keep = [Math]::Max(1, [int][Math]::Floor($out.Count * 0.8))
+                        $out.RemoveRange($keep, $out.Count - $keep)
                     }
                 }
 
@@ -251,6 +253,14 @@ function Start-SnmpTestAgent {
                 [void]$Udp.Send($bytes, $bytes.Length, $remote)
             }
 
+            $sendResponse = {
+                param ($Bytes, $Remote)
+                if ($Options.ResponseDelayMs -gt 0) {
+                    Start-Sleep -Milliseconds $Options.ResponseDelayMs
+                }
+                [void]$Udp.Send($Bytes, $Bytes.Length, $Remote)
+            }
+
             while ($true) {
                 $remote = [System.Net.IPEndPoint]::new([System.Net.IPAddress]::Any, 0)
                 try {
@@ -275,7 +285,7 @@ function Start-SnmpTestAgent {
                         }
                         $responsePdu = & $answer $message.Pdu $message.Version
                         $bytes = ConvertTo-SnmpCommunityMessage -Version $message.Version -Community $message.Community -Pdu $responsePdu
-                        [void]$Udp.Send($bytes, $bytes.Length, $remote)
+                        & $sendResponse $bytes $remote
                         continue
                     }
 
@@ -312,7 +322,7 @@ function Start-SnmpTestAgent {
 
                     $responsePdu = & $answer $scoped.Pdu 3
                     $bytes = ConvertTo-SnmpV3Message -Session $agentSession -MsgId $message.MsgId -Pdu $responsePdu -Reportable $false
-                    [void]$Udp.Send($bytes, $bytes.Length, $remote)
+                    & $sendResponse $bytes $remote
                 }
                 catch {
                     # Ignore anything the agent cannot parse or answer, like a real agent would.

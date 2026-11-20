@@ -969,17 +969,22 @@ function ConvertFrom-SnmpBerValue {
 }
 
 function ConvertTo-SnmpDisplayString {
-    # Device-supplied text (names, descriptions, aliases, location) ends up in a terminal and in
-    # result objects, so C0/C1 control characters, line and paragraph separators, and explicit
-    # bidirectional formatting controls are replaced with spaces. Ordinary international text is
-    # kept as is.
+    # Match surrogate pairs first so supplementary Unicode letters and symbols survive.
     param ($Value)
 
     if ($null -eq $Value) {
         return $null
     }
     $text = if ($Value -is [byte[]]) { [System.Text.Encoding]::UTF8.GetString($Value) } else { [string]$Value }
-    $text = $text -replace '[\p{Cc}\p{Zl}\p{Zp}؜‎‏‪-‮⁦-⁩]', ' '
+    $replaceControl = [System.Text.RegularExpressions.MatchEvaluator]{
+        param ($Match)
+        if ($Match.Length -eq 2 -and
+            [System.Globalization.CharUnicodeInfo]::GetUnicodeCategory($Match.Value, 0) -ne [System.Globalization.UnicodeCategory]::Format) {
+            return $Match.Value
+        }
+        return ' '
+    }
+    $text = [regex]::Replace($text, '[\uD800-\uDBFF][\uDC00-\uDFFF]|[\p{Cc}\p{Cf}\p{Cs}\p{Zl}\p{Zp}]', $replaceControl)
     return ($text -replace ' {2,}', ' ').Trim()
 }
 
@@ -1600,6 +1605,7 @@ function Protect-SnmpScopedPdu {
         }
         finally {
             Clear-SnmpBytes $desKey
+            Clear-SnmpBytes $iv
         }
     } else {
         $iv = Join-SnmpBytes (ConvertTo-SnmpUInt32Bytes $Boots) (ConvertTo-SnmpUInt32Bytes $Time) $salt
@@ -1634,6 +1640,7 @@ function Unprotect-SnmpScopedPdu {
         }
         finally {
             Clear-SnmpBytes $desKey
+            Clear-SnmpBytes $iv
         }
     }
 
@@ -1800,36 +1807,35 @@ function Resolve-SnmpV3Message {
     }
 }
 
-function Test-SnmpV3Timeliness {
-    # RFC 3414 §3.2 step 7(b), non-authoritative side: is an authenticated message from the agent
-    # inside the time window this session has already established? Before the first authenticated
-    # message the session has nothing to compare against, so any boots/time is acceptable.
+function Test-SnmpV3ClockAdvance {
     param ([hashtable]$Session, [long]$Boots, [long]$Time)
 
-    if ($Boots -ge 2147483647) {
+    return (-not $Session.TimeTrusted -or $Boots -gt $Session.EngineBoots -or
+        ($Boots -eq $Session.EngineBoots -and $Time -gt $Session.LatestReceivedEngineTime))
+}
+
+function Test-SnmpV3Timeliness {
+    # RFC 3414 §3.2 step 7(b) applies the window after advancing to a newer authenticated
+    # engine time. Evaluate that advance here and commit it only after validating the PDU.
+    param ([hashtable]$Session, [long]$Boots, [long]$Time)
+
+    if ($Boots -ge 2147483647 -or ($Session.TimeTrusted -and $Boots -lt $Session.EngineBoots)) {
         return $false
     }
-    if (-not $Session.TimeTrusted) {
+    if (Test-SnmpV3ClockAdvance -Session $Session -Boots $Boots -Time $Time) {
         return $true
     }
-    if ($Boots -lt $Session.EngineBoots) {
-        return $false
-    }
-    if ($Boots -eq $Session.EngineBoots -and $Time -lt (Get-SnmpEngineTime -Session $Session) - 150) {
-        return $false
-    }
-    return $true
+    return ($Time -ge (Get-SnmpEngineTime -Session $Session) - 150)
 }
 
 function Update-SnmpV3Clock {
-    # Advances, never rewinds, the session's notion of the agent's boots/time after an
-    # authenticated, timely message, and marks the clock as trusted.
+    # A newer received time can correct a running estimate that has moved too far ahead.
     param ([hashtable]$Session, [long]$Boots, [long]$Time)
 
-    if (-not $Session.TimeTrusted -or $Boots -gt $Session.EngineBoots -or
-        ($Boots -eq $Session.EngineBoots -and $Time -gt (Get-SnmpEngineTime -Session $Session))) {
+    if (Test-SnmpV3ClockAdvance -Session $Session -Boots $Boots -Time $Time) {
         $Session.EngineBoots = $Boots
         $Session.EngineTime = $Time
+        $Session.LatestReceivedEngineTime = $Time
         $Session.EngineTimeSyncedAt = $Session.Clock.Elapsed.TotalSeconds
         $Session.TimeTrusted = $true
     }
@@ -1846,6 +1852,7 @@ function Set-SnmpV3Engine {
     $Session.EngineId = $EngineId
     $Session.EngineBoots = $Boots
     $Session.EngineTime = $Time
+    $Session.LatestReceivedEngineTime = $null
     $Session.EngineTimeSyncedAt = $Session.Clock.Elapsed.TotalSeconds
     $Session.TimeTrusted = $false
 
@@ -1922,6 +1929,8 @@ function Clear-SnmpSessionSecrets {
         Clear-SnmpBytes $Session[$name]
         $Session[$name] = $null
     }
+    # The string is immutable. Release our reference after wiping the owned octets.
+    $Session.Community = $null
 }
 
 function New-SnmpSession {
@@ -2016,8 +2025,9 @@ function New-SnmpSession {
         Window         = 8
         MaxVarbinds    = 24
         MaxRepetitions = 25
-        # Per-walk budget (see Invoke-SnmpWalk).
-        WalkLimits     = @{ Seconds = 60; Rows = 50000; Bytes = 16MB }
+        # Individual column and cumulative inventory limits.
+        WalkLimits      = @{ Seconds = 60; Rows = 50000; Bytes = 16MB }
+        InventoryLimits = @{ Seconds = 60; Rows = 100000; Bytes = 32MB }
         NextId         = [System.Random]::new().Next(1, 0x3FFFFFFF)
         Clock          = [System.Diagnostics.Stopwatch]::StartNew()
         Socket         = $null
@@ -2058,6 +2068,7 @@ function New-SnmpSession {
             $session.EngineId = $null
             $session.EngineBoots = 0
             $session.EngineTime = 0
+            $session.LatestReceivedEngineTime = $null
             $session.EngineTimeSyncedAt = 0.0
             $session.TimeTrusted = $false
 
@@ -2124,7 +2135,7 @@ function New-SnmpSession {
 }
 
 function Close-SnmpSession {
-    # Disposes the socket and wipes the session's master keys, localized keys and community.
+    # Disposes the socket and wipes the session's key and community buffers.
     param ([hashtable]$Session)
 
     if ($null -eq $Session) {
@@ -2257,8 +2268,14 @@ function Get-SnmpTimeoutMessage {
     param ([hashtable]$Session, [hashtable]$Entry)
 
     $target = "$($Session.ComputerName):$($Session.Endpoint.Port)"
+    if ($Entry.StaleClock) {
+        return "$target sent an authenticated SNMPv3 time-window Report outside the trusted window. Check the agent clock and engineBoots."
+    }
     if ($Entry.Hint) {
         $detail = Get-SnmpReportMessage -Session $Session -Report $Entry.Hint
+        if ($Entry.Hint -eq 'unknownEngineIDs' -and $Session.TimeTrusted) {
+            $detail += ' Start a new session to verify the agent engine.'
+        }
         return "$detail No authenticated reply from $target after $($Entry.Attempts) attempts; the agent's report was not authenticated."
     }
     return "No SNMP response from $target after $($Entry.Attempts) attempts (check reachability, version, and credentials)."
@@ -2304,6 +2321,33 @@ function Test-SnmpResponseShape {
     return $true
 }
 
+function Read-SnmpReportName {
+    # Only the first OID is needed to classify a diagnostic. Bound the work before decoding it.
+    param ($Header, [switch]$Discovery)
+
+    if ($Header.VarbindsOffset -eq $Header.VarbindsEnd) {
+        return 'an empty report'
+    }
+    $pair = Read-SnmpBerHeader -Data $Header.Source -Offset $Header.VarbindsOffset -Limit $Header.VarbindsEnd -Tag 0x30 -What 'report varbind'
+    $pairEnd = $pair[1] + $pair[2]
+    $oid = Read-SnmpBerHeader -Data $Header.Source -Offset $pair[1] -Limit $pairEnd -Tag 0x06 -What 'report OID'
+    if ($oid[2] -gt 32) {
+        return 'an unrecognized report'
+    }
+    $name = ConvertFrom-SnmpBerOid -Data $Header.Source -Start $oid[1] -Length $oid[2]
+    if ($Discovery) {
+        # A discovery Report carries one USM statistics counter. Validate its field without
+        # constructing any varbind values from the unauthenticated PDU.
+        $counter = Read-SnmpBerHeader -Data $Header.Source -Offset ($oid[1] + $oid[2]) -Limit $pairEnd -Tag 0x41 -What 'discovery counter'
+        if ($pairEnd -ne $Header.VarbindsEnd -or $counter[1] + $counter[2] -ne $pairEnd -or
+            $counter[2] -lt 1 -or $counter[2] -gt 5 -or
+            ($counter[2] -eq 5 -and $Header.Source[$counter[1]] -ne 0)) {
+            throw 'Malformed SNMPv3 discovery report counter.'
+        }
+    }
+    return ($script:SnmpUsmReports[$name] ?? $name)
+}
+
 function Read-SnmpExchangeReply {
     <#
     Decides what one datagram from the agent means for the pending requests. Returns $null to
@@ -2312,12 +2356,12 @@ function Read-SnmpExchangeReply {
       Resend    - resend the request with a fresh msgID (authenticated time resync, or engine
                   rediscovery on a noAuthNoPriv session)
       Hint      - an unauthenticated Report; kept only to explain a later timeout
+      StaleClock - an authenticated time Report outside the trusted window
       Fail      - Message is an authoritative error
 
     Order of checks: correlate (community or msgID) -> authenticate (engine, user, MAC,
     freshness) -> decrypt -> PDU type, security level, identity, context, request-id -> decode
-    varbinds -> binding shape. Nothing is decoded beyond the envelope until the reply is
-    correlated and, where the session is protected, authenticated.
+    varbinds -> binding shape. The first Report OID may be read for a timeout diagnostic.
     #>
     param ([hashtable]$Session, [byte[]]$Data, [hashtable]$Pending)
 
@@ -2349,6 +2393,7 @@ function Read-SnmpExchangeReply {
     }
     $auth = ($message.Flags -band 0x01) -ne 0
     $priv = ($message.Flags -band 0x02) -ne 0
+    $currentAttempt = [int]$message.MsgId -eq [int]$entry.Key
     if ($priv -and -not $auth) {
         return $null
     }
@@ -2363,6 +2408,11 @@ function Read-SnmpExchangeReply {
             return $null
         }
         if (-not (Test-SnmpV3Timeliness -Session $Session -Boots $message.EngineBoots -Time $message.EngineTime)) {
+            $header = $message.ScopedPdu.Pdu
+            if ($currentAttempt -and -not $priv -and $header.PduType -eq $script:SnmpPduTypes.Report -and
+                (Read-SnmpReportName $header) -eq 'notInTimeWindows') {
+                return [PSCustomObject]@{ Entry = $entry; Action = 'StaleClock' }
+            }
             Write-Verbose 'Ignoring an authenticated SNMPv3 message outside the time window.'
             return $null
         }
@@ -2376,6 +2426,12 @@ function Read-SnmpExchangeReply {
     $header = $scoped.Pdu
 
     if ($header.PduType -eq $script:SnmpPduTypes.Report) {
+        if (-not $currentAttempt) {
+            return $null
+        }
+        if (-not $auth -and $Session.SecurityLevel -ne 'NoAuthNoPriv') {
+            return [PSCustomObject]@{ Entry = $entry; Action = 'Hint'; Hint = (Read-SnmpReportName $header) }
+        }
         $bindings = @((Complete-SnmpPdu $header).Varbinds)
         $report = if ($bindings.Count -gt 0) { $script:SnmpUsmReports[$bindings[0].Oid] ?? $bindings[0].Oid } else { 'an empty report' }
 
@@ -2389,18 +2445,12 @@ function Read-SnmpExchangeReply {
             return [PSCustomObject]@{ Entry = $entry; Action = 'Fail'; Message = (Get-SnmpReportMessage -Session $Session -Report $report) }
         }
 
-        if ($Session.SecurityLevel -eq 'NoAuthNoPriv') {
-            # Nothing at this security level can be authenticated, so Reports are taken at face value.
-            if ($report -eq 'unknownEngineIDs' -and $message.EngineId.Length -ge 5) {
-                Set-SnmpV3Engine -Session $Session -EngineId $message.EngineId -Boots $message.EngineBoots -Time $message.EngineTime
-                return [PSCustomObject]@{ Entry = $entry; Action = 'Resend' }
-            }
-            return [PSCustomObject]@{ Entry = $entry; Action = 'Fail'; Message = (Get-SnmpReportMessage -Session $Session -Report $report) }
+        # noAuthNoPriv sessions have no authenticated engine to preserve.
+        if ($report -eq 'unknownEngineIDs' -and $message.EngineId.Length -ge 5) {
+            Set-SnmpV3Engine -Session $Session -EngineId $message.EngineId -Boots $message.EngineBoots -Time $message.EngineTime
+            return [PSCustomObject]@{ Entry = $entry; Action = 'Resend' }
         }
-
-        # An unauthenticated Report against a protected session changes nothing: no engine, key or
-        # clock update and no retry. It only explains the failure if no valid reply arrives.
-        return [PSCustomObject]@{ Entry = $entry; Action = 'Hint'; Hint = $report }
+        return [PSCustomObject]@{ Entry = $entry; Action = 'Fail'; Message = (Get-SnmpReportMessage -Session $Session -Report $report) }
     }
 
     if ($header.PduType -ne $script:SnmpPduTypes.Response) {
@@ -2431,16 +2481,25 @@ function Find-SnmpV3Engine {
     # RFC 3414 §4 discovery: an empty noAuthNoPriv request should draw a usmStatsUnknownEngineIDs
     # Report naming the agent's engine. Only that Report, from the session's peer and for this
     # request's msgID, is accepted. Its boots/time are provisional until an authenticated reply.
-    param ([hashtable]$Session)
+    param ([hashtable]$Session, [hashtable]$Deadline)
 
     for ($attempt = 0; $attempt -le $Session.Retries; $attempt++) {
+        if ($null -ne $Deadline -and $Session.Clock.ElapsedMilliseconds -ge $Deadline.AtMs) {
+            throw $Deadline.Message
+        }
         $id = New-SnmpRequestId -Session $Session
         $pdu = ConvertTo-SnmpPduBytes -PduType $script:SnmpPduTypes.Get -RequestId $id -Varbinds @()
         Send-SnmpDatagram -Session $Session -Bytes (ConvertTo-SnmpV3Message -Session $Session -MsgId $id -Pdu $pdu -Discovery)
 
-        $deadline = $Session.Clock.ElapsedMilliseconds + $Session.TimeoutMs
-        while ($Session.Clock.ElapsedMilliseconds -lt $deadline) {
-            $data = Receive-SnmpDatagram -Session $Session -TimeoutMs ($deadline - $Session.Clock.ElapsedMilliseconds)
+        $attemptEndsAt = $Session.Clock.ElapsedMilliseconds + $Session.TimeoutMs
+        if ($null -ne $Deadline) {
+            $attemptEndsAt = [Math]::Min($attemptEndsAt, $Deadline.AtMs)
+        }
+        while ($Session.Clock.ElapsedMilliseconds -lt $attemptEndsAt) {
+            $data = Receive-SnmpDatagram -Session $Session -TimeoutMs ($attemptEndsAt - $Session.Clock.ElapsedMilliseconds)
+            if ($null -ne $Deadline -and $Session.Clock.ElapsedMilliseconds -ge $Deadline.AtMs) {
+                throw $Deadline.Message
+            }
             if ($null -eq $data) {
                 break
             }
@@ -2451,8 +2510,7 @@ function Find-SnmpV3Engine {
                     $message.EngineId.Length -lt 5) {
                     continue
                 }
-                $bindings = @((Complete-SnmpPdu $message.ScopedPdu.Pdu).Varbinds)
-                if ($bindings.Count -ge 1 -and $script:SnmpUsmReports[$bindings[0].Oid] -eq 'unknownEngineIDs') {
+                if ((Read-SnmpReportName -Header $message.ScopedPdu.Pdu -Discovery) -eq 'unknownEngineIDs') {
                     return [PSCustomObject]@{ EngineId = $message.EngineId; Boots = $message.EngineBoots; Time = $message.EngineTime }
                 }
             }
@@ -2461,26 +2519,28 @@ function Find-SnmpV3Engine {
             }
         }
     }
+    if ($null -ne $Deadline -and $Session.Clock.ElapsedMilliseconds -ge $Deadline.AtMs) {
+        throw $Deadline.Message
+    }
     throw "No SNMPv3 response from $($Session.ComputerName):$($Session.Endpoint.Port) (engine discovery timed out)."
 }
 
 function Initialize-SnmpV3Engine {
-    param ([hashtable]$Session)
+    param ([hashtable]$Session, [hashtable]$Deadline)
 
-    $engine = Find-SnmpV3Engine -Session $Session
+    $engine = Find-SnmpV3Engine -Session $Session -Deadline $Deadline
     Set-SnmpV3Engine -Session $Session -EngineId $engine.EngineId -Boots $engine.Boots -Time $engine.Time
 }
 
 function Invoke-SnmpExchange {
     # Sends requests with up to $Session.Window outstanding and returns the Response PDUs in
     # request order. Each request is @{ PduType; Oids; [NonRepeaters]; [MaxRepetitions] }.
-    # Every attempt of a v3 request gets a fresh msgID (earlier attempts are retired) while the
-    # PDU request-id stays fixed. Replies that fail Read-SnmpExchangeReply leave the request
-    # pending until its deadline.
-    param ([hashtable]$Session, [object[]]$Requests)
+    # Each v3 attempt gets a fresh msgID. All attempt IDs can answer the same logical request
+    # until it completes. Only the current attempt can act on a Report.
+    param ([hashtable]$Session, [object[]]$Requests, [hashtable]$Deadline)
 
     if ($Session.Version -eq 3 -and $null -eq $Session.EngineId) {
-        Initialize-SnmpV3Engine -Session $Session
+        Initialize-SnmpV3Engine -Session $Session -Deadline $Deadline
     }
 
     $count = $Requests.Count
@@ -2489,40 +2549,50 @@ function Invoke-SnmpExchange {
     $active = [System.Collections.Generic.List[hashtable]]::new()
     $next = 0
     $completed = 0
-    $rediscovered = $false
 
     $send = {
         param ([hashtable]$Entry)
-        if ($null -ne $Entry.Key) {
-            $pending.Remove($Entry.Key)
+        if ($null -ne $Deadline -and $Session.Clock.ElapsedMilliseconds -ge $Deadline.AtMs) {
+            throw $Deadline.Message
         }
         $msgId = if ($Session.Version -eq 3) { New-SnmpRequestId -Session $Session } else { $Entry.RequestId }
         $bytes = ConvertTo-SnmpRequestMessage -Session $Session -Request $Entry.Request -RequestId $Entry.RequestId -MsgId $msgId
+        if (-not $pending.ContainsKey($msgId)) {
+            $Entry.AttemptIds.Add($msgId)
+            $pending[$msgId] = $Entry
+        }
         $Entry.Key = $msgId
-        $pending[$msgId] = $Entry
-        $Entry.Deadline = $Session.Clock.ElapsedMilliseconds + $Session.TimeoutMs
+        $Entry.DeadlineMs = $Session.Clock.ElapsedMilliseconds + $Session.TimeoutMs
         Send-SnmpDatagram -Session $Session -Bytes $bytes
     }
 
     while ($completed -lt $count) {
         while ($active.Count -lt $Session.Window -and $next -lt $count) {
             $entry = @{
-                Index     = $next
-                Request   = $Requests[$next]
-                RequestId = New-SnmpRequestId -Session $Session
-                Key       = $null
-                Attempts  = 1
-                Reports   = 0
-                Hint      = $null
-                Deadline  = 0
+                Index      = $next
+                Request    = $Requests[$next]
+                RequestId  = New-SnmpRequestId -Session $Session
+                Key        = $null
+                AttemptIds = [System.Collections.Generic.List[int]]::new()
+                Attempts   = 1
+                Reports    = 0
+                Hint       = $null
+                StaleClock = $false
+                DeadlineMs = 0
             }
             $active.Add($entry)
             & $send $entry
             $next++
         }
 
-        $nearest = ($active | ForEach-Object { $_.Deadline } | Measure-Object -Minimum).Minimum
+        $nearest = [long](($active | ForEach-Object { $_.DeadlineMs } | Measure-Object -Minimum).Minimum)
+        if ($null -ne $Deadline) {
+            $nearest = [Math]::Min($nearest, $Deadline.AtMs)
+        }
         $data = Receive-SnmpDatagram -Session $Session -TimeoutMs ($nearest - $Session.Clock.ElapsedMilliseconds)
+        if ($null -ne $Deadline -and $Session.Clock.ElapsedMilliseconds -ge $Deadline.AtMs) {
+            throw $Deadline.Message
+        }
         if ($null -ne $data) {
             $reply = $null
             try {
@@ -2537,7 +2607,9 @@ function Invoke-SnmpExchange {
                 switch ($reply.Action) {
                     'Complete' {
                         $results[$entry.Index] = $reply.Pdu
-                        $pending.Remove($entry.Key)
+                        foreach ($key in $entry.AttemptIds) {
+                            $pending.Remove($key)
+                        }
                         [void]$active.Remove($entry)
                         $completed++
                     }
@@ -2551,6 +2623,9 @@ function Invoke-SnmpExchange {
                     'Hint' {
                         $entry.Hint = $reply.Hint
                     }
+                    'StaleClock' {
+                        $entry.StaleClock = $true
+                    }
                     'Fail' {
                         throw $reply.Message
                     }
@@ -2560,26 +2635,10 @@ function Invoke-SnmpExchange {
 
         $now = $Session.Clock.ElapsedMilliseconds
         foreach ($entry in @($active)) {
-            if ($now -lt $entry.Deadline) {
+            if ($now -lt $entry.DeadlineMs) {
                 continue
             }
             if ($entry.Attempts -gt $Session.Retries) {
-                # Unauthenticated unknownEngineIDs Reports may mean the agent's engine really
-                # changed. Rediscover once; a new engine is adopted provisionally and must then
-                # answer with valid authentication.
-                if ($Session.Version -eq 3 -and $entry.Hint -eq 'unknownEngineIDs' -and -not $rediscovered) {
-                    $rediscovered = $true
-                    $candidate = Find-SnmpV3Engine -Session $Session
-                    if (-not (Test-SnmpBytesEqual $candidate.EngineId $Session.EngineId)) {
-                        Set-SnmpV3Engine -Session $Session -EngineId $candidate.EngineId -Boots $candidate.Boots -Time $candidate.Time
-                        foreach ($other in @($active)) {
-                            $other.Attempts = 1
-                            $other.Hint = $null
-                            & $send $other
-                        }
-                        break
-                    }
-                }
                 throw (Get-SnmpTimeoutMessage -Session $Session -Entry $entry)
             }
             $entry.Attempts++
@@ -2602,7 +2661,7 @@ function Get-SnmpErrorName {
 function Invoke-SnmpGet {
     # Fetches many OIDs, batching varbinds per request. Returns a hashtable of OID -> varbind.
     # Each successful batch has already been checked to contain exactly its requested OIDs.
-    param ([hashtable]$Session, [string[]]$Oid)
+    param ([hashtable]$Session, [string[]]$Oid, [hashtable]$Deadline)
 
     $results = @{}
     $queue = [System.Collections.Generic.List[object]]::new()
@@ -2618,7 +2677,7 @@ function Invoke-SnmpGet {
         $requests = foreach ($batch in $batches) {
             @{ PduType = $script:SnmpPduTypes.Get; Oids = $batch }
         }
-        $responses = Invoke-SnmpExchange -Session $Session -Requests @($requests)
+        $responses = Invoke-SnmpExchange -Session $Session -Requests @($requests) -Deadline $Deadline
 
         for ($i = 0; $i -lt $batches.Count; $i++) {
             $batch = $batches[$i]
@@ -2679,34 +2738,34 @@ function Compare-SnmpOid {
 }
 
 function Invoke-SnmpWalk {
-    # Walks the subtree under $RootOid with GetNext (v1) or GetBulk. Every returned OID must be
-    # numerically greater than the previous one, and the walk is bounded by $Session.WalkLimits
-    # (elapsed seconds, rows, retained bytes). Exceeding a limit or going backwards throws rather
-    # than returning a partial table that could pass for a complete one.
-    param ([hashtable]$Session, [string]$RootOid, [string]$Name)
+    # Check each column's limits and the shared inventory budget before retaining a page.
+    param ([hashtable]$Session, [string]$RootOid, [string]$Name, [hashtable]$Budget)
 
     $root = $RootOid.TrimStart('.')
     $label = if ($Name) { "$Name ($root)" } else { $root }
     $rootArcs = ConvertTo-SnmpOidArcs $root
     $limits = $Session.WalkLimits ?? @{ Seconds = 60; Rows = 50000; Bytes = 16MB }
-    $watch = [System.Diagnostics.Stopwatch]::StartNew()
+    $deadline = @{
+        AtMs    = $Session.Clock.ElapsedMilliseconds + [long][Math]::Ceiling($limits.Seconds * 1000)
+        Message = "SNMP walk of $label on $($Session.ComputerName) exceeded its $($limits.Seconds)-second limit; the table is incomplete."
+    }
+    if ($null -ne $Budget -and $Budget.Deadline.AtMs -le $deadline.AtMs) {
+        $deadline = $Budget.Deadline
+    }
     $results = [System.Collections.Generic.List[object]]::new()
-    $retainedBytes = 0
+    $retainedBytes = 0L
     $current = $root
     $lastArcs = $rootArcs
 
     while ($true) {
-        if ($watch.Elapsed.TotalSeconds -gt $limits.Seconds) {
-            throw "SNMP walk of $label on $($Session.ComputerName) exceeded its $($limits.Seconds)-second limit after $($results.Count) rows; the table is incomplete."
-        }
         $request = if ($Session.Version -eq 0) {
             @{ PduType = $script:SnmpPduTypes.GetNext; Oids = @($current) }
         } else {
             @{ PduType = $script:SnmpPduTypes.GetBulk; Oids = @($current); NonRepeaters = 0; MaxRepetitions = $Session.MaxRepetitions }
         }
-        $pdu = (Invoke-SnmpExchange -Session $Session -Requests @($request))[0]
+        $pdu = (Invoke-SnmpExchange -Session $Session -Requests @($request) -Deadline $deadline)[0]
 
-        if ($pdu.ErrorStatus -eq 2) {
+        if ($Session.Version -eq 0 -and $pdu.ErrorStatus -eq 2) {
             break
         }
         if ($pdu.ErrorStatus -eq 1 -and $Session.Version -ne 0 -and $Session.MaxRepetitions -gt 1) {
@@ -2717,11 +2776,11 @@ function Invoke-SnmpWalk {
             throw "SNMP agent $($Session.ComputerName) returned error '$(Get-SnmpErrorName $pdu.ErrorStatus)' walking $label."
         }
         if ($pdu.Varbinds.Count -eq 0) {
-            break
+            throw "SNMP agent $($Session.ComputerName) returned an empty page walking $label; the table is incomplete."
         }
 
         $batch = [System.Collections.Generic.List[object]]::new()
-        $batchBytes = 0
+        $batchBytes = 0L
         $finished = $false
         foreach ($varbind in $pdu.Varbinds) {
             if ($varbind.Type -in 'EndOfMibView', 'NoSuchObject', 'NoSuchInstance') {
@@ -2744,16 +2803,32 @@ function Invoke-SnmpWalk {
             $batch.Add($varbind)
         }
 
-        # Check the budget before keeping the batch.
+        # Report aggregate exhaustion even if this optional column also exceeded its own limit.
+        if ($null -ne $Budget) {
+            $rows = $Budget.Rows + $batch.Count
+            $bytes = $Budget.Bytes + $batchBytes
+            if ($rows -gt $Budget.Limits.Rows -or $bytes -gt $Budget.Limits.Bytes) {
+                $Budget.Exhausted = $true
+                $limit = if ($rows -gt $Budget.Limits.Rows) { "$($Budget.Limits.Rows)-row" } else { "$($Budget.Limits.Bytes)-byte" }
+                throw "SNMP inventory on $($Session.ComputerName) exceeded its $limit limit walking $label; the inventory is incomplete."
+            }
+        }
         if ($results.Count + $batch.Count -gt $limits.Rows) {
             throw "SNMP walk of $label on $($Session.ComputerName) exceeded its $($limits.Rows)-row limit; the table is incomplete."
         }
         if ($retainedBytes + $batchBytes -gt $limits.Bytes) {
             throw "SNMP walk of $label on $($Session.ComputerName) exceeded its $($limits.Bytes)-byte limit; the table is incomplete."
         }
+        if ($Session.Clock.ElapsedMilliseconds -ge $deadline.AtMs) {
+            throw $deadline.Message
+        }
+        if ($null -ne $Budget) {
+            $Budget.Rows = $rows
+            $Budget.Bytes = $bytes
+        }
         $results.AddRange($batch)
         $retainedBytes += $batchBytes
-        if ($finished -or $batch.Count -eq 0) {
+        if ($finished) {
             break
         }
         $current = $batch[$batch.Count - 1].Oid
@@ -2845,10 +2920,10 @@ function Get-SnmpTypedValue {
 function Get-SnmpColumn {
     # Walks a table column and returns a hashtable of index -> value, keeping only values with the
     # expected SMI type and range.
-    param ([hashtable]$Session, [string]$ColumnOid, [string[]]$Type, $Minimum = $null, $Maximum = $null, [string]$Name)
+    param ([hashtable]$Session, [string]$ColumnOid, [string[]]$Type, $Minimum = $null, $Maximum = $null, [string]$Name, [hashtable]$Budget)
 
     $map = @{}
-    foreach ($varbind in (Invoke-SnmpWalk -Session $Session -RootOid $ColumnOid -Name $Name)) {
+    foreach ($varbind in (Invoke-SnmpWalk -Session $Session -RootOid $ColumnOid -Name $Name -Budget $Budget)) {
         $index = 0
         $suffix = $varbind.Oid.Substring($ColumnOid.Length + 1)
         if (-not [int]::TryParse($suffix, [System.Globalization.NumberStyles]::None, [cultureinfo]::InvariantCulture, [ref]$index) -or $index -lt 1) {
@@ -2865,18 +2940,18 @@ function Get-SnmpColumn {
 function Get-SnmpHostResources {
     # HOST-RESOURCES-MIB: per-CPU load (hrProcessorLoad) and the RAM entry of hrStorageTable.
     # Returns $null when the agent exposes neither, so callers can simply skip CPU/memory.
-    param ([hashtable]$Session)
+    param ([hashtable]$Session, [hashtable]$Budget)
 
     $cpuIndexes = @()
     $ram = $null
     try {
-        $loads = Get-SnmpColumn -Session $Session -ColumnOid $script:IfMib.HrProcessorLoad -Type Integer -Minimum 0 -Maximum 100 -Name 'hrProcessorLoad'
+        $loads = Get-SnmpColumn -Session $Session -ColumnOid $script:IfMib.HrProcessorLoad -Type Integer -Minimum 0 -Maximum 100 -Name 'hrProcessorLoad' -Budget $Budget
         $cpuIndexes = @($loads.Keys | Sort-Object)
-        $storageTypes = Get-SnmpColumn -Session $Session -ColumnOid $script:IfMib.HrStorageType -Type ObjectIdentifier -Name 'hrStorageType'
+        $storageTypes = Get-SnmpColumn -Session $Session -ColumnOid $script:IfMib.HrStorageType -Type ObjectIdentifier -Name 'hrStorageType' -Budget $Budget
         $ramIndex = @($storageTypes.Keys | Where-Object { $storageTypes[$_] -eq $script:IfMib.HrStorageRam } | Sort-Object | Select-Object -First 1)
         if ($ramIndex.Count -gt 0) {
             $i = $ramIndex[0]
-            $values = Invoke-SnmpGet -Session $Session -Oid @("$($script:IfMib.HrStorageUnits).$i", "$($script:IfMib.HrStorageSize).$i")
+            $values = Invoke-SnmpGet -Session $Session -Oid @("$($script:IfMib.HrStorageUnits).$i", "$($script:IfMib.HrStorageSize).$i") -Deadline $Budget.Deadline
             $units = Get-SnmpTypedValue $values["$($script:IfMib.HrStorageUnits).$i"] -Type Integer -Minimum 1
             $size = Get-SnmpTypedValue $values["$($script:IfMib.HrStorageSize).$i"] -Type Integer -Minimum 1
             if ($null -ne $units -and $null -ne $size) {
@@ -2885,6 +2960,9 @@ function Get-SnmpHostResources {
         }
     }
     catch {
+        if ($null -ne $Budget -and ($Budget.Exhausted -or $Session.Clock.ElapsedMilliseconds -ge $Budget.Deadline.AtMs)) {
+            throw
+        }
         Write-Verbose "HOST-RESOURCES-MIB unavailable: $($_.Exception.Message)"
     }
 
@@ -2900,11 +2978,22 @@ function Get-SnmpHostResources {
 function Get-SnmpInterfaceInventory {
     param ([hashtable]$Session, [switch]$IncludeHostResources)
 
-    $system = Invoke-SnmpGet -Session $Session -Oid @($script:IfMib.SysDescr, $script:IfMib.SysUpTime, $script:IfMib.SysName, $script:IfMib.SysLocation)
+    $limits = $Session.InventoryLimits
+    $budget = @{
+        Limits = $limits
+        Deadline = @{
+            AtMs = $Session.Clock.ElapsedMilliseconds + [long][Math]::Ceiling($limits.Seconds * 1000)
+            Message = "SNMP inventory on $($Session.ComputerName) exceeded its $($limits.Seconds)-second limit; the inventory is incomplete."
+        }
+        Rows = 0L
+        Bytes = 0L
+        Exhausted = $false
+    }
+    $system = Invoke-SnmpGet -Session $Session -Oid @($script:IfMib.SysDescr, $script:IfMib.SysUpTime, $script:IfMib.SysName, $script:IfMib.SysLocation) -Deadline $budget.Deadline
 
     $column = {
         param ([string]$Name, [string[]]$Type, $Minimum = $null, $Maximum = $null)
-        Get-SnmpColumn -Session $Session -ColumnOid $script:IfMib[$Name] -Type $Type -Minimum $Minimum -Maximum $Maximum -Name $Name
+        Get-SnmpColumn -Session $Session -ColumnOid $script:IfMib[$Name] -Type $Type -Minimum $Minimum -Maximum $Maximum -Name $Name -Budget $budget
     }
     $descr = & $column IfDescr OctetString
     $type = & $column IfType Integer 1
@@ -2924,6 +3013,9 @@ function Get-SnmpInterfaceInventory {
     }
 
     $interfaces = foreach ($index in $allIndexes) {
+        if ($Session.Clock.ElapsedMilliseconds -ge $budget.Deadline.AtMs) {
+            throw $budget.Deadline.Message
+        }
         $highCapacity = $hcIn.ContainsKey($index)
         if (-not $highCapacity -and -not $in32.ContainsKey($index)) {
             continue
@@ -2954,14 +3046,19 @@ function Get-SnmpInterfaceInventory {
         }
     }
 
-    [PSCustomObject]@{
+    $hostResources = if ($IncludeHostResources) { Get-SnmpHostResources -Session $Session -Budget $budget } else { $null }
+    $inventory = [PSCustomObject]@{
         SysName       = ConvertTo-SnmpDisplayString (Get-SnmpTypedValue $system[$script:IfMib.SysName] -Type OctetString)
         SysDescr      = ConvertTo-SnmpDisplayString (Get-SnmpTypedValue $system[$script:IfMib.SysDescr] -Type OctetString)
         SysLocation   = ConvertTo-SnmpDisplayString (Get-SnmpTypedValue $system[$script:IfMib.SysLocation] -Type OctetString)
         SysUpTime     = Get-SnmpTypedValue $system[$script:IfMib.SysUpTime] -Type TimeTicks
-        HostResources = if ($IncludeHostResources) { Get-SnmpHostResources -Session $Session } else { $null }
+        HostResources = $hostResources
         Interfaces    = @($interfaces)
     }
+    if ($Session.Clock.ElapsedMilliseconds -ge $budget.Deadline.AtMs) {
+        throw $budget.Deadline.Message
+    }
+    return $inventory
 }
 
 function Get-SnmpInterfaceSample {
@@ -4492,6 +4589,10 @@ function Get-SnmpInterface {
     }
 }
 
+function Test-BandwidthMonitorTerminal {
+    return (-not ([Console]::IsInputRedirected -or [Console]::IsOutputRedirected))
+}
+
 function Invoke-BandwidthMonitor {
     <#
     .SYNOPSIS
@@ -4658,7 +4759,7 @@ function Invoke-BandwidthMonitor {
         [int]$Retries = 1
     )
 
-    if ([Console]::IsOutputRedirected -or [Console]::IsInputRedirected) {
+    if (-not (Test-BandwidthMonitorTerminal)) {
         throw 'Invoke-BandwidthMonitor needs an interactive terminal. Use Get-SnmpInterface -SampleSeconds for scripted output.'
     }
 

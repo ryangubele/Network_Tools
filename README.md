@@ -153,7 +153,8 @@ Invoke-BwMon core1 -V3 -UserName monitor -AuthProtocol SHA256 -AuthPassword $aut
 - Privacy protocols: DES, AES (128), AES192/AES256 (Blumenthal key extension, net-snmp `AES192`/`AES256`), and AES192C/AES256C (Reeder key extension, used by Cisco).
 - Omitting `-PrivPassword` gives authNoPriv. Passwords can be strings or SecureStrings, must be at least 8 characters, and can't be empty when given. Inconsistent options are rejected before anything is sent: v3 options without `-UserName`, or with `-V1`/`-V2c`, are errors rather than a silent fallback to v2c.
 - Replies must match the request's security level, user, engine, context and request ID, and must come from the agent's address and port. Anything else is ignored.
-- An agent rejecting your credentials sends an unauthenticated report. The monitor doesn't act on it, because anyone could forge one. The specific error ("authentication failed", "user not known") is shown when the request times out.
+- An unauthenticated report can explain a timeout, for example when the agent rejects the username or credentials. A protected session keeps its confirmed engine and keys. If the agent's engine ID changes, open a new session to verify it.
+- Interface discovery enforces time, row, and size limits for each column and for the inventory as a whole. An incomplete interface column produces an error.
 - Verified against MikroTik RouterOS 7.25.1 over v2c and over v3 authPriv (SHA256/AES). Other combinations are tested against the RFC 3414 key test vectors and the loopback test agent.
 
 Limit the view to some interfaces (by index, name, description, or alias; wildcards are allowed):
