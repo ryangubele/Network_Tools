@@ -3481,7 +3481,9 @@ function Get-BandwidthFraction {
         # 1 kbps sits at the edge, link speed at the centre.
         $floor = [Math]::Log10(1000)
         $top = [Math]::Log10([Math]::Max($ScaleBps, 10000.0))
-        return [Math]::Max(0.0, [Math]::Min(1.0, ([Math]::Log10([Math]::Max([double]$BitsPerSecond, 1.0)) - $floor) / ($top - $floor)))
+        $fraction = ([Math]::Log10([Math]::Max([double]$BitsPerSecond, 1.0)) - $floor) / ($top - $floor)
+        $fraction = [Math]::Max(0.0, [Math]::Min(1.0, $fraction))
+        return [Math]::Pow($fraction, 2.5)
     }
     return [Math]::Min(1.0, [double]$BitsPerSecond / $ScaleBps)
 }

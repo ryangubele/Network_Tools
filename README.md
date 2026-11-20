@@ -188,18 +188,16 @@ Stop-SnmpTestAgent $agent
 
 ## Tests
 
-The tests run on Pester 4.10.1 on Windows and Linux. Install it, then load it explicitly so the Pester 3.4 that ships with Windows isn't used instead:
+The tests require Pester 5 on Windows and Linux. Install it, then load it explicitly so the Pester 3.4 that ships with Windows isn't used instead:
 
 ```powershell
-Install-Module Pester -RequiredVersion 4.10.1 -Scope CurrentUser -SkipPublisherCheck
+Install-Module Pester -MinimumVersion 5.0.0 -Scope CurrentUser -SkipPublisherCheck
 ```
 
 ```powershell
-Import-Module Pester -RequiredVersion 4.10.1
+Import-Module Pester -MinimumVersion 5.0.0
 Invoke-Pester -Script .\tests\Network-Tools.Tests.ps1
 ```
-
-Pester 3.4 also works on Windows, but it doesn't load on Linux.
 
 ## Notes
 
