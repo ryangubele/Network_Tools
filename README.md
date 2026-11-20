@@ -151,7 +151,9 @@ Invoke-BwMon core1 -V3 -UserName monitor -AuthProtocol SHA256 -AuthPassword $aut
 
 - Auth protocols: MD5, SHA (SHA-1), SHA256, SHA384, SHA512.
 - Privacy protocols: DES, AES (128), AES192/AES256 (Blumenthal key extension, net-snmp `AES192`/`AES256`), and AES192C/AES256C (Reeder key extension, used by Cisco).
-- Omitting `-PrivPassword` gives authNoPriv. Passwords can be strings or SecureStrings.
+- Omitting `-PrivPassword` gives authNoPriv. Passwords can be strings or SecureStrings, must be at least 8 characters, and can't be empty when given. Inconsistent options are rejected before anything is sent: v3 options without `-UserName`, or with `-V1`/`-V2c`, are errors rather than a silent fallback to v2c.
+- Replies must match the request's security level, user, engine, context and request ID, and must come from the agent's address and port. Anything else is ignored.
+- An agent rejecting your credentials sends an unauthenticated report. The monitor doesn't act on it, because anyone could forge one. The specific error ("authentication failed", "user not known") is shown when the request times out.
 - Verified against MikroTik RouterOS 7.25.1 over v2c and over v3 authPriv (SHA256/AES). Other combinations are tested against the RFC 3414 key test vectors and the loopback test agent.
 
 Limit the view to some interfaces (by index, name, description, or alias; wildcards are allowed):
@@ -183,11 +185,18 @@ Stop-SnmpTestAgent $agent
 
 ## Tests
 
-Run the Pester tests:
+The tests run on Pester 4.10.1 on Windows and Linux. Install it, then load it explicitly so the Pester 3.4 that ships with Windows isn't used instead:
 
 ```powershell
+Install-Module Pester -RequiredVersion 4.10.1 -Scope CurrentUser -SkipPublisherCheck
+```
+
+```powershell
+Import-Module Pester -RequiredVersion 4.10.1
 Invoke-Pester -Script .\tests\Network-Tools.Tests.ps1
 ```
+
+Pester 3.4 also works on Windows, but it doesn't load on Linux.
 
 ## Notes
 

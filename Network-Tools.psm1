@@ -816,20 +816,29 @@ function ConvertTo-SnmpBerOidTlv {
 }
 
 function Read-SnmpBerHeader {
-    # Returns @(tag, contentStart, contentLength) for the TLV at $Offset.
-    param ([byte[]]$Data, [int]$Offset, [int]$Limit)
+    # Returns @(tag, contentStart, contentLength) for the TLV at $Offset, which must lie entirely
+    # within $Limit. With -Tag the element must carry that tag; $What names it in errors.
+    param ([byte[]]$Data, [int]$Offset, [int]$Limit, [int]$Tag = -1, [string]$What = 'element')
 
-    if ($Offset + 2 -gt $Limit) {
-        throw 'Malformed SNMP packet: truncated BER header.'
+    if ($Offset -lt 0 -or $Limit -gt $Data.Length -or $Offset + 2 -gt $Limit) {
+        throw "Malformed SNMP packet: truncated $What."
     }
 
-    $tag = [int]$Data[$Offset]
-    $length = [int]$Data[$Offset + 1]
+    $actualTag = [int]$Data[$Offset]
+    if (($actualTag -band 0x1F) -eq 0x1F) {
+        throw "Malformed SNMP packet: unsupported multi-octet tag in $What."
+    }
+    if ($Tag -ge 0 -and $actualTag -ne $Tag) {
+        throw ('Malformed SNMP packet: expected tag 0x{0:X2} for {1}, found 0x{2:X2}.' -f $Tag, $What, $actualTag)
+    }
+
+    [long]$length = $Data[$Offset + 1]
     $position = $Offset + 2
     if ($length -band 0x80) {
-        $count = $length -band 0x7F
+        # 0x80 on its own is the indefinite form, which SNMP does not use.
+        $count = [int]($length -band 0x7F)
         if ($count -lt 1 -or $count -gt 4 -or $position + $count -gt $Limit) {
-            throw 'Malformed SNMP packet: invalid BER length.'
+            throw "Malformed SNMP packet: invalid length for $What."
         }
         $length = 0
         for ($i = 0; $i -lt $count; $i++) {
@@ -838,18 +847,21 @@ function Read-SnmpBerHeader {
         $position += $count
     }
 
-    if ($length -lt 0 -or $position + $length -gt $Limit) {
-        throw 'Malformed SNMP packet: BER length exceeds packet.'
+    if ($position + $length -gt $Limit) {
+        throw "Malformed SNMP packet: $What extends past its container."
     }
-
-    return [int[]]@($tag, $position, $length)
+    return [int[]]@($actualTag, $position, [int]$length)
 }
 
 function ConvertFrom-SnmpBerSigned {
+    # INTEGER values in SNMP are Integer32, so one to four content octets.
     param ([byte[]]$Data, [int]$Start, [int]$Length)
 
+    if ($Length -lt 1 -or $Length -gt 4) {
+        throw "Malformed SNMP packet: INTEGER with $Length content octets."
+    }
     [long]$value = 0
-    if ($Length -gt 0 -and ($Data[$Start] -band 0x80)) {
+    if ($Data[$Start] -band 0x80) {
         $value = -1
     }
     for ($i = $Start; $i -lt $Start + $Length; $i++) {
@@ -859,8 +871,15 @@ function ConvertFrom-SnmpBerSigned {
 }
 
 function ConvertFrom-SnmpBerUnsigned {
-    param ([byte[]]$Data, [int]$Start, [int]$Length)
+    # Counter32/Gauge32/TimeTicks ($Bits = 32) or Counter64 ($Bits = 64). A value with its top bit
+    # set needs a leading zero octet, so Bits/8 + 1 octets are legal when the first one is zero.
+    # Agents that omit that octet are still read as unsigned, since these types cannot be negative.
+    param ([byte[]]$Data, [int]$Start, [int]$Length, [int]$Bits = 64)
 
+    $octets = [int]($Bits / 8)
+    if ($Length -lt 1 -or $Length -gt $octets + 1 -or ($Length -eq $octets + 1 -and $Data[$Start] -ne 0)) {
+        throw "Malformed SNMP packet: $Bits-bit unsigned value with $Length content octets."
+    }
     [uint64]$value = 0
     for ($i = $Start; $i -lt $Start + $Length; $i++) {
         $value = ($value -shl 8) -bor [uint64]$Data[$i]
@@ -869,16 +888,37 @@ function ConvertFrom-SnmpBerUnsigned {
 }
 
 function ConvertFrom-SnmpBerOid {
+    # Decodes an OBJECT IDENTIFIER, rejecting encodings that could alias another OID: an
+    # unterminated last sub-identifier, a non-minimal sub-identifier (leading 0x80 octet), a
+    # sub-identifier wider than 32 bits, or more than 128 sub-identifiers (RFC 2578 §3.5).
     param ([byte[]]$Data, [int]$Start, [int]$Length)
+
+    if ($Length -lt 1) {
+        throw 'Malformed SNMP packet: empty OBJECT IDENTIFIER.'
+    }
+    $end = $Start + $Length
+    if ($Data[$end - 1] -band 0x80) {
+        throw 'Malformed SNMP packet: unterminated OBJECT IDENTIFIER.'
+    }
 
     $builder = [System.Text.StringBuilder]::new()
     [uint64]$current = 0
-    $first = $true
-    for ($i = $Start; $i -lt $Start + $Length; $i++) {
+    $arcs = 0
+    $startOfArc = $true
+    for ($i = $Start; $i -lt $end; $i++) {
         $byte = $Data[$i]
+        if ($startOfArc -and $byte -eq 0x80) {
+            throw 'Malformed SNMP packet: non-minimal OBJECT IDENTIFIER sub-identifier.'
+        }
+        $startOfArc = $false
         $current = ($current -shl 7) -bor [uint64]($byte -band 0x7F)
+        # The first sub-identifier packs two arcs (X * 40 + Y), so it may exceed 2^32 - 1 by 80.
+        $maximum = if ($arcs -eq 0) { [uint64]4294967375 } else { [uint64][uint32]::MaxValue }
+        if ($current -gt $maximum) {
+            throw 'Malformed SNMP packet: OBJECT IDENTIFIER sub-identifier out of range.'
+        }
         if (-not ($byte -band 0x80)) {
-            if ($first) {
+            if ($arcs -eq 0) {
                 if ($current -lt 40) {
                     [void]$builder.Append('0.').Append($current)
                 } elseif ($current -lt 80) {
@@ -886,12 +926,17 @@ function ConvertFrom-SnmpBerOid {
                 } else {
                     [void]$builder.Append('2.').Append($current - 80)
                 }
-                $first = $false
+                $arcs = 2
             } else {
                 [void]$builder.Append('.').Append($current)
+                $arcs++
             }
             $current = 0
+            $startOfArc = $true
         }
+    }
+    if ($arcs -gt 128) {
+        throw 'Malformed SNMP packet: OBJECT IDENTIFIER has more than 128 sub-identifiers.'
     }
     return $builder.ToString()
 }
@@ -902,29 +947,40 @@ function ConvertFrom-SnmpBerValue {
     switch ($Tag) {
         0x02 { return ConvertFrom-SnmpBerSigned -Data $Data -Start $Start -Length $Length }
         0x04 { return , (Get-SnmpByteSlice -Data $Data -Start $Start -Length $Length) }
+        0x05 {
+            if ($Length -ne 0) { throw 'Malformed SNMP packet: NULL with content.' }
+            return $null
+        }
         0x06 { return ConvertFrom-SnmpBerOid -Data $Data -Start $Start -Length $Length }
         0x40 {
-            if ($Length -eq 4) {
-                return ('{0}.{1}.{2}.{3}' -f $Data[$Start], $Data[$Start + 1], $Data[$Start + 2], $Data[$Start + 3])
-            }
-            return , (Get-SnmpByteSlice -Data $Data -Start $Start -Length $Length)
+            if ($Length -ne 4) { throw 'Malformed SNMP packet: IpAddress must be four octets.' }
+            return ('{0}.{1}.{2}.{3}' -f $Data[$Start], $Data[$Start + 1], $Data[$Start + 2], $Data[$Start + 3])
         }
-        { $_ -in 0x41, 0x42, 0x43, 0x46 } { return ConvertFrom-SnmpBerUnsigned -Data $Data -Start $Start -Length $Length }
+        { $_ -in 0x41, 0x42, 0x43 } { return ConvertFrom-SnmpBerUnsigned -Data $Data -Start $Start -Length $Length -Bits 32 }
+        0x46 { return ConvertFrom-SnmpBerUnsigned -Data $Data -Start $Start -Length $Length -Bits 64 }
         0x44 { return , (Get-SnmpByteSlice -Data $Data -Start $Start -Length $Length) }
+        { $_ -in 0x80, 0x81, 0x82 } {
+            if ($Length -ne 0) { throw 'Malformed SNMP packet: exception value with content.' }
+            return $null
+        }
     }
+    # Unknown application types are kept untyped; typed readers ignore them.
     return $null
 }
 
 function ConvertTo-SnmpDisplayString {
+    # Device-supplied text (names, descriptions, aliases, location) ends up in a terminal and in
+    # result objects, so C0/C1 control characters, line and paragraph separators, and explicit
+    # bidirectional formatting controls are replaced with spaces. Ordinary international text is
+    # kept as is.
     param ($Value)
 
     if ($null -eq $Value) {
         return $null
     }
-    if ($Value -is [byte[]]) {
-        return ([System.Text.Encoding]::UTF8.GetString($Value) -replace '[\x00-\x1F\x7F]', ' ').Trim()
-    }
-    return ([string]$Value).Trim()
+    $text = if ($Value -is [byte[]]) { [System.Text.Encoding]::UTF8.GetString($Value) } else { [string]$Value }
+    $text = $text -replace '[\p{Cc}\p{Zl}\p{Zp}؜‎‏‪-‮⁦-⁩]', ' '
+    return ($text -replace ' {2,}', ' ').Trim()
 }
 
 function ConvertTo-SnmpValueTlv {
@@ -990,125 +1046,213 @@ function ConvertTo-SnmpVarbindListTlv {
     return , (ConvertTo-SnmpBerTlv -Tag 0x30 -Content $varbindBytes.ToArray())
 }
 
-function ConvertFrom-SnmpPdu {
+function Read-SnmpPduHeader {
+    # Reads a PDU's type and integer fields and locates its varbind list without decoding the
+    # bindings (see Complete-SnmpPdu). The PDU must end exactly at $Limit.
     param ([byte[]]$Data, [int]$Offset, [int]$Limit)
 
-    $header = Read-SnmpBerHeader -Data $Data -Offset $Offset -Limit $Limit
+    $header = Read-SnmpBerHeader -Data $Data -Offset $Offset -Limit $Limit -What 'PDU'
     $pduType = $header[0]
-    $position = $header[1]
+    if ($pduType -lt 0xA0 -or $pduType -gt 0xA8 -or $pduType -eq 0xA4) {
+        throw ('Malformed SNMP packet: unsupported PDU type 0x{0:X2}.' -f $pduType)
+    }
     $end = $header[1] + $header[2]
+    if ($end -ne $Limit) {
+        throw 'Malformed SNMP packet: trailing data after the PDU.'
+    }
 
+    $position = $header[1]
     $numbers = [long[]]::new(3)
+    $names = 'request-id', 'error-status', 'error-index'
     for ($i = 0; $i -lt 3; $i++) {
-        $field = Read-SnmpBerHeader -Data $Data -Offset $position -Limit $end
-        if ($field[0] -ne 0x02) {
-            throw 'Malformed SNMP PDU: expected INTEGER.'
-        }
+        $field = Read-SnmpBerHeader -Data $Data -Offset $position -Limit $end -Tag 0x02 -What $names[$i]
         $numbers[$i] = ConvertFrom-SnmpBerSigned -Data $Data -Start $field[1] -Length $field[2]
         $position = $field[1] + $field[2]
     }
+    $list = Read-SnmpBerHeader -Data $Data -Offset $position -Limit $end -Tag 0x30 -What 'varbind list'
+    if ($list[1] + $list[2] -ne $end) {
+        throw 'Malformed SNMP packet: trailing data after the varbind list.'
+    }
 
-    $listHeader = Read-SnmpBerHeader -Data $Data -Offset $position -Limit $end
-    $cursor = $listHeader[1]
-    $listEnd = $listHeader[1] + $listHeader[2]
+    [PSCustomObject]@{
+        PduType        = $pduType
+        RequestId      = [int]$numbers[0]
+        ErrorStatus    = [int]$numbers[1]
+        ErrorIndex     = [int]$numbers[2]
+        Varbinds       = $null
+        Source         = $Data
+        VarbindsOffset = $list[1]
+        VarbindsEnd    = $list[1] + $list[2]
+    }
+}
+
+function ConvertFrom-SnmpVarbindList {
+    param ([byte[]]$Data, [int]$Offset, [int]$End)
+
     $varbinds = [System.Collections.Generic.List[object]]::new()
-    while ($cursor -lt $listEnd) {
-        $pairHeader = Read-SnmpBerHeader -Data $Data -Offset $cursor -Limit $listEnd
-        $pairEnd = $pairHeader[1] + $pairHeader[2]
-        $oidHeader = Read-SnmpBerHeader -Data $Data -Offset $pairHeader[1] -Limit $pairEnd
+    $cursor = $Offset
+    while ($cursor -lt $End) {
+        $pair = Read-SnmpBerHeader -Data $Data -Offset $cursor -Limit $End -Tag 0x30 -What 'varbind'
+        $pairEnd = $pair[1] + $pair[2]
+        $oidHeader = Read-SnmpBerHeader -Data $Data -Offset $pair[1] -Limit $pairEnd -Tag 0x06 -What 'varbind name'
         $oid = ConvertFrom-SnmpBerOid -Data $Data -Start $oidHeader[1] -Length $oidHeader[2]
-        $valueHeader = Read-SnmpBerHeader -Data $Data -Offset ($oidHeader[1] + $oidHeader[2]) -Limit $pairEnd
+        $valueHeader = Read-SnmpBerHeader -Data $Data -Offset ($oidHeader[1] + $oidHeader[2]) -Limit $pairEnd -What 'varbind value'
+        if ($valueHeader[1] + $valueHeader[2] -ne $pairEnd) {
+            throw 'Malformed SNMP packet: trailing data inside a varbind.'
+        }
         $value = ConvertFrom-SnmpBerValue -Data $Data -Tag $valueHeader[0] -Start $valueHeader[1] -Length $valueHeader[2]
-        $typeName = $script:SnmpTagNames[[int]$valueHeader[0]] ?? ('0x{0:X2}' -f $valueHeader[0])
         $varbinds.Add([PSCustomObject]@{
             Oid   = $oid
-            Type  = $typeName
+            Type  = $script:SnmpTagNames[[int]$valueHeader[0]] ?? ('0x{0:X2}' -f $valueHeader[0])
             Value = $value
         })
         $cursor = $pairEnd
     }
+    return , $varbinds.ToArray()
+}
 
-    [PSCustomObject]@{
-        PduType     = $pduType
-        RequestId   = [int]$numbers[0]
-        ErrorStatus = [int]$numbers[1]
-        ErrorIndex  = [int]$numbers[2]
-        Varbinds    = $varbinds.ToArray()
+function Complete-SnmpPdu {
+    # Decodes the varbinds of a PDU header from Read-SnmpPduHeader (no-op if already decoded).
+    param ($Header)
+
+    if ($null -ne $Header.Varbinds) {
+        return $Header
     }
+    [PSCustomObject]@{
+        PduType     = $Header.PduType
+        RequestId   = $Header.RequestId
+        ErrorStatus = $Header.ErrorStatus
+        ErrorIndex  = $Header.ErrorIndex
+        Varbinds    = ConvertFrom-SnmpVarbindList -Data $Header.Source -Offset $Header.VarbindsOffset -End $Header.VarbindsEnd
+    }
+}
+
+function ConvertFrom-SnmpPdu {
+    param ([byte[]]$Data, [int]$Offset, [int]$Limit)
+
+    return Complete-SnmpPdu (Read-SnmpPduHeader -Data $Data -Offset $Offset -Limit $Limit)
 }
 
 function ConvertFrom-SnmpScopedPdu {
-    param ([byte[]]$Data, [int]$Offset, [int]$Limit)
+    # $Padding allows that many trailing octets after the scoped PDU (DES pads the plaintext to a
+    # multiple of eight). -HeaderOnly leaves the varbinds undecoded.
+    param ([byte[]]$Data, [int]$Offset, [int]$Limit, [int]$Padding = 0, [switch]$HeaderOnly)
 
-    $header = Read-SnmpBerHeader -Data $Data -Offset $Offset -Limit $Limit
-    if ($header[0] -ne 0x30) {
-        throw 'Malformed SNMPv3 scoped PDU.'
-    }
+    $header = Read-SnmpBerHeader -Data $Data -Offset $Offset -Limit $Limit -Tag 0x30 -What 'scoped PDU'
     $end = $header[1] + $header[2]
-    $engineHeader = Read-SnmpBerHeader -Data $Data -Offset $header[1] -Limit $end
-    $nameHeader = Read-SnmpBerHeader -Data $Data -Offset ($engineHeader[1] + $engineHeader[2]) -Limit $end
+    if ($Limit - $end -gt $Padding) {
+        throw 'Malformed SNMPv3 message: trailing data after the scoped PDU.'
+    }
+    $engineHeader = Read-SnmpBerHeader -Data $Data -Offset $header[1] -Limit $end -Tag 0x04 -What 'contextEngineID'
+    $nameHeader = Read-SnmpBerHeader -Data $Data -Offset ($engineHeader[1] + $engineHeader[2]) -Limit $end -Tag 0x04 -What 'contextName'
+    $pdu = Read-SnmpPduHeader -Data $Data -Offset ($nameHeader[1] + $nameHeader[2]) -Limit $end
+    if (-not $HeaderOnly) {
+        $pdu = Complete-SnmpPdu $pdu
+    }
 
     [PSCustomObject]@{
-        ContextEngineId = Get-SnmpByteSlice -Data $Data -Start $engineHeader[1] -Length $engineHeader[2]
-        ContextName     = [System.Text.Encoding]::UTF8.GetString($Data, $nameHeader[1], $nameHeader[2])
-        Pdu             = ConvertFrom-SnmpPdu -Data $Data -Offset ($nameHeader[1] + $nameHeader[2]) -Limit $end
+        ContextEngineId  = Get-SnmpByteSlice -Data $Data -Start $engineHeader[1] -Length $engineHeader[2]
+        ContextName      = [System.Text.Encoding]::UTF8.GetString($Data, $nameHeader[1], $nameHeader[2])
+        ContextNameBytes = Get-SnmpByteSlice -Data $Data -Start $nameHeader[1] -Length $nameHeader[2]
+        Pdu              = $pdu
     }
 }
 
-function ConvertFrom-SnmpMessage {
-    param ([byte[]]$Data)
+function Read-SnmpNonNegativeInteger {
+    param ([byte[]]$Data, [int]$Offset, [int]$Limit, [string]$What)
 
-    $outer = Read-SnmpBerHeader -Data $Data -Offset 0 -Limit $Data.Length
-    if ($outer[0] -ne 0x30) {
-        throw 'Not an SNMP message.'
+    $header = Read-SnmpBerHeader -Data $Data -Offset $Offset -Limit $Limit -Tag 0x02 -What $What
+    $value = ConvertFrom-SnmpBerSigned -Data $Data -Start $header[1] -Length $header[2]
+    if ($value -lt 0) {
+        throw "Malformed SNMP packet: negative $What."
     }
+    return [PSCustomObject]@{ Value = $value; End = $header[1] + $header[2] }
+}
+
+function ConvertFrom-SnmpMessage {
+    # Decodes an SNMP message. -Envelope stops at what is needed to correlate and authenticate it:
+    # the PDU header is read, but its varbinds are left for Complete-SnmpPdu.
+    param ([byte[]]$Data, [switch]$Envelope)
+
+    $outer = Read-SnmpBerHeader -Data $Data -Offset 0 -Limit $Data.Length -Tag 0x30 -What 'message'
     $end = $outer[1] + $outer[2]
-    $versionHeader = Read-SnmpBerHeader -Data $Data -Offset $outer[1] -Limit $end
+    if ($end -ne $Data.Length) {
+        throw 'Malformed SNMP packet: trailing data after the message.'
+    }
+    $versionHeader = Read-SnmpBerHeader -Data $Data -Offset $outer[1] -Limit $end -Tag 0x02 -What 'version'
     $version = [int](ConvertFrom-SnmpBerSigned -Data $Data -Start $versionHeader[1] -Length $versionHeader[2])
     $position = $versionHeader[1] + $versionHeader[2]
 
     if ($version -in 0, 1) {
-        $communityHeader = Read-SnmpBerHeader -Data $Data -Offset $position -Limit $end
-        $pdu = ConvertFrom-SnmpPdu -Data $Data -Offset ($communityHeader[1] + $communityHeader[2]) -Limit $end
+        $communityHeader = Read-SnmpBerHeader -Data $Data -Offset $position -Limit $end -Tag 0x04 -What 'community'
+        $pdu = Read-SnmpPduHeader -Data $Data -Offset ($communityHeader[1] + $communityHeader[2]) -Limit $end
+        if (-not $Envelope) {
+            $pdu = Complete-SnmpPdu $pdu
+        }
         return [PSCustomObject]@{
-            Version   = $version
-            Community = [System.Text.Encoding]::UTF8.GetString($Data, $communityHeader[1], $communityHeader[2])
-            MsgId     = $pdu.RequestId
-            Pdu       = $pdu
+            Version        = $version
+            Community      = [System.Text.Encoding]::UTF8.GetString($Data, $communityHeader[1], $communityHeader[2])
+            CommunityBytes = Get-SnmpByteSlice -Data $Data -Start $communityHeader[1] -Length $communityHeader[2]
+            MsgId          = $pdu.RequestId
+            Pdu            = $pdu
         }
     }
-
     if ($version -ne 3) {
         throw "Unsupported SNMP version $version."
     }
 
     # msgGlobalData
-    $globalHeader = Read-SnmpBerHeader -Data $Data -Offset $position -Limit $end
-    $globalEnd = $globalHeader[1] + $globalHeader[2]
-    $msgIdHeader = Read-SnmpBerHeader -Data $Data -Offset $globalHeader[1] -Limit $globalEnd
-    $maxSizeHeader = Read-SnmpBerHeader -Data $Data -Offset ($msgIdHeader[1] + $msgIdHeader[2]) -Limit $globalEnd
-    $flagsHeader = Read-SnmpBerHeader -Data $Data -Offset ($maxSizeHeader[1] + $maxSizeHeader[2]) -Limit $globalEnd
-    $flags = if ($flagsHeader[2] -gt 0) { [int]$Data[$flagsHeader[1]] } else { 0 }
-    $position = $globalEnd
+    $global = Read-SnmpBerHeader -Data $Data -Offset $position -Limit $end -Tag 0x30 -What 'msgGlobalData'
+    $globalEnd = $global[1] + $global[2]
+    $msgId = Read-SnmpNonNegativeInteger -Data $Data -Offset $global[1] -Limit $globalEnd -What 'msgID'
+    $maxSize = Read-SnmpNonNegativeInteger -Data $Data -Offset $msgId.End -Limit $globalEnd -What 'msgMaxSize'
+    if ($maxSize.Value -lt 484) {
+        throw 'Malformed SNMPv3 message: msgMaxSize below 484.'
+    }
+    $flagsHeader = Read-SnmpBerHeader -Data $Data -Offset $maxSize.End -Limit $globalEnd -Tag 0x04 -What 'msgFlags'
+    if ($flagsHeader[2] -ne 1) {
+        throw 'Malformed SNMPv3 message: msgFlags must be one octet.'
+    }
+    $model = Read-SnmpNonNegativeInteger -Data $Data -Offset ($flagsHeader[1] + 1) -Limit $globalEnd -What 'msgSecurityModel'
+    if ($model.End -ne $globalEnd) {
+        throw 'Malformed SNMPv3 message: trailing data in msgGlobalData.'
+    }
+    if ($model.Value -ne 3) {
+        throw "Unsupported SNMPv3 security model $($model.Value)."
+    }
 
-    # msgSecurityParameters (OCTET STRING wrapping UsmSecurityParameters)
-    $securityHeader = Read-SnmpBerHeader -Data $Data -Offset $position -Limit $end
-    $securityEnd = $securityHeader[1] + $securityHeader[2]
-    $usmHeader = Read-SnmpBerHeader -Data $Data -Offset $securityHeader[1] -Limit $securityEnd
-    $usmEnd = $usmHeader[1] + $usmHeader[2]
-    $engineHeader = Read-SnmpBerHeader -Data $Data -Offset $usmHeader[1] -Limit $usmEnd
-    $bootsHeader = Read-SnmpBerHeader -Data $Data -Offset ($engineHeader[1] + $engineHeader[2]) -Limit $usmEnd
-    $timeHeader = Read-SnmpBerHeader -Data $Data -Offset ($bootsHeader[1] + $bootsHeader[2]) -Limit $usmEnd
-    $userHeader = Read-SnmpBerHeader -Data $Data -Offset ($timeHeader[1] + $timeHeader[2]) -Limit $usmEnd
-    $authHeader = Read-SnmpBerHeader -Data $Data -Offset ($userHeader[1] + $userHeader[2]) -Limit $usmEnd
-    $privHeader = Read-SnmpBerHeader -Data $Data -Offset ($authHeader[1] + $authHeader[2]) -Limit $usmEnd
-    $position = $securityEnd
+    # msgSecurityParameters: an OCTET STRING holding exactly one UsmSecurityParameters sequence.
+    $security = Read-SnmpBerHeader -Data $Data -Offset $globalEnd -Limit $end -Tag 0x04 -What 'msgSecurityParameters'
+    $securityEnd = $security[1] + $security[2]
+    $usm = Read-SnmpBerHeader -Data $Data -Offset $security[1] -Limit $securityEnd -Tag 0x30 -What 'USM security parameters'
+    $usmEnd = $usm[1] + $usm[2]
+    if ($usmEnd -ne $securityEnd) {
+        throw 'Malformed SNMPv3 message: trailing data in msgSecurityParameters.'
+    }
+    $engineHeader = Read-SnmpBerHeader -Data $Data -Offset $usm[1] -Limit $usmEnd -Tag 0x04 -What 'msgAuthoritativeEngineID'
+    if ($engineHeader[2] -gt 32) {
+        throw 'Malformed SNMPv3 message: engine ID longer than 32 octets.'
+    }
+    $boots = Read-SnmpNonNegativeInteger -Data $Data -Offset ($engineHeader[1] + $engineHeader[2]) -Limit $usmEnd -What 'msgAuthoritativeEngineBoots'
+    $time = Read-SnmpNonNegativeInteger -Data $Data -Offset $boots.End -Limit $usmEnd -What 'msgAuthoritativeEngineTime'
+    $userHeader = Read-SnmpBerHeader -Data $Data -Offset $time.End -Limit $usmEnd -Tag 0x04 -What 'msgUserName'
+    if ($userHeader[2] -gt 32) {
+        throw 'Malformed SNMPv3 message: user name longer than 32 octets.'
+    }
+    $authHeader = Read-SnmpBerHeader -Data $Data -Offset ($userHeader[1] + $userHeader[2]) -Limit $usmEnd -Tag 0x04 -What 'msgAuthenticationParameters'
+    $privHeader = Read-SnmpBerHeader -Data $Data -Offset ($authHeader[1] + $authHeader[2]) -Limit $usmEnd -Tag 0x04 -What 'msgPrivacyParameters'
+    if ($privHeader[1] + $privHeader[2] -ne $usmEnd) {
+        throw 'Malformed SNMPv3 message: trailing data in USM security parameters.'
+    }
 
-    $dataHeader = Read-SnmpBerHeader -Data $Data -Offset $position -Limit $end
+    $dataHeader = Read-SnmpBerHeader -Data $Data -Offset $securityEnd -Limit $end -What 'msgData'
+    if ($dataHeader[1] + $dataHeader[2] -ne $end) {
+        throw 'Malformed SNMPv3 message: trailing data after msgData.'
+    }
     $scopedPdu = $null
     $encryptedPdu = $null
     if ($dataHeader[0] -eq 0x30) {
-        $scopedPdu = ConvertFrom-SnmpScopedPdu -Data $Data -Offset $position -Limit $end
+        $scopedPdu = ConvertFrom-SnmpScopedPdu -Data $Data -Offset $securityEnd -Limit $end -HeaderOnly:$Envelope
     } elseif ($dataHeader[0] -eq 0x04) {
         $encryptedPdu = Get-SnmpByteSlice -Data $Data -Start $dataHeader[1] -Length $dataHeader[2]
     } else {
@@ -1116,19 +1260,22 @@ function ConvertFrom-SnmpMessage {
     }
 
     [PSCustomObject]@{
-        Version      = 3
-        MsgId        = [int](ConvertFrom-SnmpBerSigned -Data $Data -Start $msgIdHeader[1] -Length $msgIdHeader[2])
-        Flags        = $flags
-        EngineId     = Get-SnmpByteSlice -Data $Data -Start $engineHeader[1] -Length $engineHeader[2]
-        EngineBoots  = ConvertFrom-SnmpBerSigned -Data $Data -Start $bootsHeader[1] -Length $bootsHeader[2]
-        EngineTime   = ConvertFrom-SnmpBerSigned -Data $Data -Start $timeHeader[1] -Length $timeHeader[2]
-        UserName     = [System.Text.Encoding]::UTF8.GetString($Data, $userHeader[1], $userHeader[2])
-        AuthParams   = Get-SnmpByteSlice -Data $Data -Start $authHeader[1] -Length $authHeader[2]
-        AuthOffset   = $authHeader[1]
-        PrivParams   = Get-SnmpByteSlice -Data $Data -Start $privHeader[1] -Length $privHeader[2]
-        ScopedPdu    = $scopedPdu
-        EncryptedPdu = $encryptedPdu
-        Pdu          = $scopedPdu?.Pdu
+        Version       = 3
+        MsgId         = [int]$msgId.Value
+        MsgMaxSize    = $maxSize.Value
+        Flags         = [int]$Data[$flagsHeader[1]]
+        SecurityModel = [int]$model.Value
+        EngineId      = Get-SnmpByteSlice -Data $Data -Start $engineHeader[1] -Length $engineHeader[2]
+        EngineBoots   = $boots.Value
+        EngineTime    = $time.Value
+        UserName      = [System.Text.Encoding]::UTF8.GetString($Data, $userHeader[1], $userHeader[2])
+        UserNameBytes = Get-SnmpByteSlice -Data $Data -Start $userHeader[1] -Length $userHeader[2]
+        AuthParams    = Get-SnmpByteSlice -Data $Data -Start $authHeader[1] -Length $authHeader[2]
+        AuthOffset    = $authHeader[1]
+        PrivParams    = Get-SnmpByteSlice -Data $Data -Start $privHeader[1] -Length $privHeader[2]
+        ScopedPdu     = $scopedPdu
+        EncryptedPdu  = $encryptedPdu
+        Pdu           = if ($null -ne $scopedPdu) { $scopedPdu.Pdu } else { $null }
     }
 }
 
@@ -1186,8 +1333,40 @@ function Get-SnmpHmac {
     }
 }
 
+function Clear-SnmpBytes {
+    # Zeroes a module-owned buffer that held key or password material.
+    param ($Buffer)
+
+    if ($Buffer -is [byte[]]) {
+        [Array]::Clear($Buffer, 0, $Buffer.Length)
+    } elseif ($Buffer -is [char[]]) {
+        [Array]::Clear($Buffer, 0, $Buffer.Length)
+    }
+}
+
+function Test-SnmpBytesEqual {
+    # Compares two byte arrays without returning early at the first difference, so the time taken
+    # does not depend on where they differ (used for MACs and identifiers).
+    param ([byte[]]$Left, [byte[]]$Right)
+
+    if ($null -eq $Left -or $null -eq $Right) {
+        return ($null -eq $Left -and $null -eq $Right)
+    }
+    if ($Left.Length -ne $Right.Length) {
+        return $false
+    }
+    $difference = 0
+    for ($i = 0; $i -lt $Left.Length; $i++) {
+        $difference = $difference -bor ($Left[$i] -bxor $Right[$i])
+    }
+    return $difference -eq 0
+}
+
 function ConvertTo-SnmpUsmKey {
-    # RFC 3414 A.2 password-to-key: hash 1 MiB of the repeated password.
+    # RFC 3414 A.2 password-to-key: hash the password repeated to 1 MiB. The repetition is fed to
+    # the hash from one small buffer holding a whole number of password copies, so every chunk
+    # starts on a password boundary; the buffer is cleared afterwards. Callers enforce password
+    # policy: the Reeder key extension also passes binary key material through here.
     param ([string]$HashName, [byte[]]$Password)
 
     if ($null -eq $Password -or $Password.Length -eq 0) {
@@ -1195,23 +1374,38 @@ function ConvertTo-SnmpUsmKey {
     }
 
     $total = 1048576
-    $buffer = [byte[]]::new($total)
-    $filled = [Math]::Min($Password.Length, $total)
-    [Array]::Copy($Password, 0, $buffer, 0, $filled)
-    while ($filled -lt $total) {
-        # $filled is always a multiple of the password length here, so the copy keeps the repetition aligned.
-        $count = [Math]::Min($filled, $total - $filled)
-        [Array]::Copy($buffer, 0, $buffer, $filled, $count)
-        $filled += $count
+    $copies = [Math]::Max(1, [int][Math]::Ceiling(4096 / $Password.Length))
+    $chunk = [byte[]]::new($Password.Length * $copies)
+    $hash = New-SnmpHashAlgorithm -Name $HashName
+    try {
+        for ($i = 0; $i -lt $copies; $i++) {
+            [Array]::Copy($Password, 0, $chunk, $i * $Password.Length, $Password.Length)
+        }
+        $remaining = $total
+        while ($remaining -gt $chunk.Length) {
+            [void]$hash.TransformBlock($chunk, 0, $chunk.Length, $null, 0)
+            $remaining -= $chunk.Length
+        }
+        [void]$hash.TransformFinalBlock($chunk, 0, $remaining)
+        return , $hash.Hash
     }
-    return , (Get-SnmpHash -HashName $HashName -Data $buffer)
+    finally {
+        Clear-SnmpBytes $chunk
+        $hash.Dispose()
+    }
 }
 
 function Get-SnmpLocalizedKey {
     # RFC 3414 A.2 key localization: H(Ku || engineID || Ku).
     param ([string]$HashName, [byte[]]$Key, [byte[]]$EngineId)
 
-    return , (Get-SnmpHash -HashName $HashName -Data (Join-SnmpBytes $Key $EngineId $Key))
+    $buffer = Join-SnmpBytes $Key $EngineId $Key
+    try {
+        return , (Get-SnmpHash -HashName $HashName -Data $buffer)
+    }
+    finally {
+        Clear-SnmpBytes $buffer
+    }
 }
 
 function Get-SnmpPrivacyKey {
@@ -1219,21 +1413,37 @@ function Get-SnmpPrivacyKey {
 
     $spec = $script:SnmpPrivProtocols[$PrivProtocol]
     $key = Get-SnmpLocalizedKey -HashName $HashName -Key $MasterKey -EngineId $EngineId
-    while ($key.Length -lt $spec.KeyLength) {
-        switch ($spec.Extend) {
-            'Blumenthal' {
-                $key = Join-SnmpBytes $key (Get-SnmpHash -HashName $HashName -Data $key)
+    try {
+        while ($key.Length -lt $spec.KeyLength) {
+            switch ($spec.Extend) {
+                'Blumenthal' {
+                    $digest = Get-SnmpHash -HashName $HashName -Data $key
+                    $extended = Join-SnmpBytes $key $digest
+                    Clear-SnmpBytes $digest
+                }
+                'Reeder' {
+                    $master = ConvertTo-SnmpUsmKey -HashName $HashName -Password $key
+                    try {
+                        $digest = Get-SnmpLocalizedKey -HashName $HashName -Key $master -EngineId $EngineId
+                    }
+                    finally {
+                        Clear-SnmpBytes $master
+                    }
+                    $extended = Join-SnmpBytes $key $digest
+                    Clear-SnmpBytes $digest
+                }
+                default {
+                    throw "The auth protocol hash is too short to derive a $PrivProtocol privacy key."
+                }
             }
-            'Reeder' {
-                $extension = Get-SnmpLocalizedKey -HashName $HashName -Key (ConvertTo-SnmpUsmKey -HashName $HashName -Password $key) -EngineId $EngineId
-                $key = Join-SnmpBytes $key $extension
-            }
-            default {
-                throw "The auth protocol hash is too short to derive a $PrivProtocol privacy key."
-            }
+            Clear-SnmpBytes $key
+            $key = $extended
         }
+        return , (Get-SnmpByteSlice -Data $key -Start 0 -Length $spec.KeyLength)
     }
-    return , (Get-SnmpByteSlice -Data $key -Start 0 -Length $spec.KeyLength)
+    finally {
+        Clear-SnmpBytes $key
+    }
 }
 
 function ConvertTo-SnmpUInt32Bytes {
@@ -1261,6 +1471,13 @@ function Invoke-SnmpAesCfb {
             $output = [byte[]]::new($Data.Length)
             $feedback = [byte[]]$Iv.Clone()
             $keystream = [byte[]]::new(16)
+            # The next feedback block is the ciphertext: the input when decrypting, the output when
+            # encrypting. Plain assignments keep this a reference (an if-expression would enumerate
+            # the whole array into a new one).
+            $cipherText = $output
+            if ($Decrypt) {
+                $cipherText = $Data
+            }
             for ($offset = 0; $offset -lt $Data.Length; $offset += 16) {
                 [void]$encryptor.TransformBlock($feedback, 0, 16, $keystream, 0)
                 $count = [Math]::Min(16, $Data.Length - $offset)
@@ -1268,13 +1485,13 @@ function Invoke-SnmpAesCfb {
                     $output[$offset + $i] = $Data[$offset + $i] -bxor $keystream[$i]
                 }
                 if ($count -eq 16) {
-                    $source = if ($Decrypt) { $Data } else { $output }
-                    [Array]::Copy($source, $offset, $feedback, 0, 16)
+                    [Array]::Copy($cipherText, $offset, $feedback, 0, 16)
                 }
             }
             return , $output
         }
         finally {
+            Clear-SnmpBytes $keystream
             $encryptor.Dispose()
         }
     }
@@ -1306,15 +1523,68 @@ function Invoke-SnmpDesCbc {
     }
 }
 
+function Get-SnmpSaltAllocator {
+    # The 64-bit privacy salt counter is shared by every session in the process, including other
+    # runspaces that load this module, and starts from the platform CSPRNG. One counter means
+    # concurrent and successive sessions never hand out the same salt under the same key, and a
+    # random start makes reuse across process restarts negligibly likely.
+    $name = 'NetworkTools.Snmp.SaltAllocator'
+    $domain = [System.AppDomain]::CurrentDomain
+    $allocator = $domain.GetData($name)
+    if ($null -eq $allocator) {
+        [System.Threading.Monitor]::Enter($domain)
+        try {
+            $allocator = $domain.GetData($name)
+            if ($null -eq $allocator) {
+                $seed = [byte[]]::new(8)
+                $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+                try {
+                    $rng.GetBytes($seed)
+                }
+                finally {
+                    $rng.Dispose()
+                }
+                $allocator = [uint64[]]@([BitConverter]::ToUInt64($seed, 0))
+                $domain.SetData($name, $allocator)
+            }
+        }
+        finally {
+            [System.Threading.Monitor]::Exit($domain)
+        }
+    }
+    return , $allocator
+}
+
+function New-SnmpPrivacySalt {
+    # Returns the next 8-octet salt (big-endian counter value) and advances the counter, wrapping
+    # at 2^64. -Allocator takes a one-element [uint64[]] so tests can supply deterministic state.
+    param ($Allocator)
+
+    if ($null -eq $Allocator) {
+        $Allocator = Get-SnmpSaltAllocator
+    }
+    [System.Threading.Monitor]::Enter($Allocator)
+    try {
+        [uint64]$value = $Allocator[0]
+        $Allocator[0] = if ($value -eq [uint64]::MaxValue) { [uint64]0 } else { [uint64]($value + 1) }
+    }
+    finally {
+        [System.Threading.Monitor]::Exit($Allocator)
+    }
+    return , (Join-SnmpBytes (ConvertTo-SnmpUInt32Bytes ($value -shr 32)) (ConvertTo-SnmpUInt32Bytes $value))
+}
+
 function Protect-SnmpScopedPdu {
-    param ([hashtable]$Session, [byte[]]$Plain, [long]$Boots, [long]$Time)
+    # DES (RFC 3414 §8.1.1.1) and AES (RFC 3826 §3.1.2.1). Both take their salt from the sender-side
+    # allocator. For DES the RFC suggests the sender's boots plus a counter; this manager has no
+    # persistent boots, so the whole 64-bit allocator value is the salt, which gives the same
+    # uniqueness guarantee. The AES IV keeps the mandated authoritative boots/time layout.
+    param ([hashtable]$Session, [byte[]]$Plain, [long]$Boots, [long]$Time, $Allocator)
 
     $spec = $script:SnmpPrivProtocols[$Session.PrivProtocol]
-    $Session.SaltCounter = if ($Session.SaltCounter -eq [uint64]::MaxValue) { [uint64]0 } else { [uint64]($Session.SaltCounter + 1) }
-    $counter = [uint64]$Session.SaltCounter
+    $salt = New-SnmpPrivacySalt -Allocator $Allocator
 
     if ($spec.Cipher -eq 'DES') {
-        $salt = Join-SnmpBytes (ConvertTo-SnmpUInt32Bytes $Boots) (ConvertTo-SnmpUInt32Bytes $counter)
         $iv = [byte[]]::new(8)
         for ($i = 0; $i -lt 8; $i++) {
             $iv[$i] = $Session.PrivKey[8 + $i] -bxor $salt[$i]
@@ -1324,9 +1594,14 @@ function Protect-SnmpScopedPdu {
             $padded = [byte[]]::new($Plain.Length + (8 - $Plain.Length % 8))
             [Array]::Copy($Plain, $padded, $Plain.Length)
         }
-        $cipher = Invoke-SnmpDesCbc -Key (Get-SnmpByteSlice $Session.PrivKey 0 8) -Iv $iv -Data $padded
+        $desKey = Get-SnmpByteSlice $Session.PrivKey 0 8
+        try {
+            $cipher = Invoke-SnmpDesCbc -Key $desKey -Iv $iv -Data $padded
+        }
+        finally {
+            Clear-SnmpBytes $desKey
+        }
     } else {
-        $salt = Join-SnmpBytes (ConvertTo-SnmpUInt32Bytes ($counter -shr 32)) (ConvertTo-SnmpUInt32Bytes $counter)
         $iv = Join-SnmpBytes (ConvertTo-SnmpUInt32Bytes $Boots) (ConvertTo-SnmpUInt32Bytes $Time) $salt
         $cipher = Invoke-SnmpAesCfb -Key $Session.PrivKey -Iv $iv -Data $Plain
     }
@@ -1353,7 +1628,13 @@ function Unprotect-SnmpScopedPdu {
         for ($i = 0; $i -lt 8; $i++) {
             $iv[$i] = $Session.PrivKey[8 + $i] -bxor $Salt[$i]
         }
-        return , (Invoke-SnmpDesCbc -Key (Get-SnmpByteSlice $Session.PrivKey 0 8) -Iv $iv -Data $Cipher -Decrypt)
+        $desKey = Get-SnmpByteSlice $Session.PrivKey 0 8
+        try {
+            return , (Invoke-SnmpDesCbc -Key $desKey -Iv $iv -Data $Cipher -Decrypt)
+        }
+        finally {
+            Clear-SnmpBytes $desKey
+        }
     }
 
     $iv = Join-SnmpBytes (ConvertTo-SnmpUInt32Bytes $Boots) (ConvertTo-SnmpUInt32Bytes $Time) $Salt
@@ -1385,15 +1666,18 @@ function ConvertTo-SnmpV3Message {
     }
 
     if ($Discovery) {
+        # Discovery is unauthenticated plaintext: it carries no user and no context name.
         $engineId = [byte[]]::new(0)
         $boots = 0
         $time = 0
         $UserName = ''
+        $context = ''
         $SecurityLevel = 'NoAuthNoPriv'
     } else {
         $engineId = $Session.EngineId
         $boots = $Session.EngineBoots
         $time = Get-SnmpEngineTime -Session $Session
+        $context = $Session.Context ?? ''
     }
 
     $useAuth = $SecurityLevel -ne 'NoAuthNoPriv'
@@ -1405,7 +1689,7 @@ function ConvertTo-SnmpV3Message {
 
     $scoped = ConvertTo-SnmpBerTlv -Tag 0x30 -Content (Join-SnmpBytes `
         (ConvertTo-SnmpBerOctetStringTlv -Value $engineId) `
-        (ConvertTo-SnmpBerOctetStringTlv -Value ($Session.Context ?? '')) `
+        (ConvertTo-SnmpBerOctetStringTlv -Value $context) `
         $Pdu)
 
     $privParams = [byte[]]::new(0)
@@ -1452,56 +1736,125 @@ function ConvertTo-SnmpV3Message {
     return , $message
 }
 
-function Resolve-SnmpV3Message {
-    # Verifies authentication and decrypts an incoming v3 message; returns the scoped PDU.
+function Test-SnmpV3Mac {
+    # True when the message's msgAuthenticationParameters is the expected HMAC under the session's
+    # localized authentication key.
     param ([hashtable]$Session, [byte[]]$Data, $Message)
 
-    if ($Message.Flags -band 0x01) {
-        if ($null -eq $Session.AuthKey) {
-            throw 'Received an authenticated SNMPv3 message but no authentication key is configured.'
-        }
-        $authSpec = $script:SnmpAuthProtocols[$Session.AuthProtocol]
-        if ($Message.AuthParams.Length -ne $authSpec.MacLength) {
-            throw 'SNMPv3 authentication failed: unexpected digest length.'
-        }
-        $copy = [byte[]]$Data.Clone()
-        [Array]::Clear($copy, $Message.AuthOffset, $Message.AuthParams.Length)
-        $expected = Get-SnmpHmac -HashName $authSpec.Hash -Key $Session.AuthKey -Data $copy -Length $authSpec.MacLength
-        if ([BitConverter]::ToString($expected) -ne [BitConverter]::ToString($Message.AuthParams)) {
-            throw 'SNMPv3 authentication failed: message digest mismatch.'
-        }
+    if ($null -eq $Session.AuthKey -or $null -eq $Session.AuthProtocol) {
+        return $false
     }
-
-    if ($Message.Flags -band 0x02) {
-        if ($null -eq $Session.PrivKey) {
-            throw 'Received an encrypted SNMPv3 message but no privacy key is configured.'
-        }
-        if ($null -eq $Message.EncryptedPdu) {
-            throw 'SNMPv3 message is flagged as encrypted but carries a plaintext PDU.'
-        }
-        $plain = Unprotect-SnmpScopedPdu -Session $Session -Cipher $Message.EncryptedPdu -Salt $Message.PrivParams -Boots $Message.EngineBoots -Time $Message.EngineTime
-        return ConvertFrom-SnmpScopedPdu -Data $plain -Offset 0 -Limit $plain.Length
+    $authSpec = $script:SnmpAuthProtocols[$Session.AuthProtocol]
+    if ($Message.AuthParams.Length -ne $authSpec.MacLength) {
+        return $false
     }
+    $copy = [byte[]]$Data.Clone()
+    [Array]::Clear($copy, $Message.AuthOffset, $Message.AuthParams.Length)
+    $expected = Get-SnmpHmac -HashName $authSpec.Hash -Key $Session.AuthKey -Data $copy -Length $authSpec.MacLength
+    return Test-SnmpBytesEqual $expected $Message.AuthParams
+}
 
+function Get-SnmpV3DecryptedScopedPdu {
+    param ([hashtable]$Session, $Message, [switch]$HeaderOnly)
+
+    if ($null -eq $Session.PrivKey) {
+        throw 'Received an encrypted SNMPv3 message but no privacy key is configured.'
+    }
+    if ($null -eq $Message.EncryptedPdu) {
+        throw 'SNMPv3 message is flagged as encrypted but carries a plaintext PDU.'
+    }
+    $plain = Unprotect-SnmpScopedPdu -Session $Session -Cipher $Message.EncryptedPdu -Salt $Message.PrivParams -Boots $Message.EngineBoots -Time $Message.EngineTime
+    $padding = if ($script:SnmpPrivProtocols[$Session.PrivProtocol].Cipher -eq 'DES') { 7 } else { 0 }
+    return ConvertFrom-SnmpScopedPdu -Data $plain -Offset 0 -Limit $plain.Length -Padding $padding -HeaderOnly:$HeaderOnly
+}
+
+function Resolve-SnmpV3Message {
+    # Verifies the MAC (when flagged) before decrypting (when flagged) and returns the scoped PDU.
+    # The loopback test agent uses this for incoming requests; the client applies its stricter
+    # response rules in Read-SnmpExchangeReply.
+    param ([hashtable]$Session, [byte[]]$Data, $Message, [switch]$HeaderOnly)
+
+    $auth = ($Message.Flags -band 0x01) -ne 0
+    $priv = ($Message.Flags -band 0x02) -ne 0
+    if ($priv -and -not $auth) {
+        throw 'SNMPv3 message requests privacy without authentication.'
+    }
+    if ($auth -and -not (Test-SnmpV3Mac -Session $Session -Data $Data -Message $Message)) {
+        throw 'SNMPv3 authentication failed: message digest mismatch.'
+    }
+    if ($priv) {
+        return Get-SnmpV3DecryptedScopedPdu -Session $Session -Message $Message -HeaderOnly:$HeaderOnly
+    }
     if ($null -eq $Message.ScopedPdu) {
         throw 'SNMPv3 message is encrypted but privacy is not configured.'
     }
-    return $Message.ScopedPdu
+    if ($HeaderOnly) {
+        return $Message.ScopedPdu
+    }
+    $scoped = $Message.ScopedPdu
+    [PSCustomObject]@{
+        ContextEngineId  = $scoped.ContextEngineId
+        ContextName      = $scoped.ContextName
+        ContextNameBytes = $scoped.ContextNameBytes
+        Pdu              = Complete-SnmpPdu $scoped.Pdu
+    }
+}
+
+function Test-SnmpV3Timeliness {
+    # RFC 3414 §3.2 step 7(b), non-authoritative side: is an authenticated message from the agent
+    # inside the time window this session has already established? Before the first authenticated
+    # message the session has nothing to compare against, so any boots/time is acceptable.
+    param ([hashtable]$Session, [long]$Boots, [long]$Time)
+
+    if ($Boots -ge 2147483647) {
+        return $false
+    }
+    if (-not $Session.TimeTrusted) {
+        return $true
+    }
+    if ($Boots -lt $Session.EngineBoots) {
+        return $false
+    }
+    if ($Boots -eq $Session.EngineBoots -and $Time -lt (Get-SnmpEngineTime -Session $Session) - 150) {
+        return $false
+    }
+    return $true
+}
+
+function Update-SnmpV3Clock {
+    # Advances, never rewinds, the session's notion of the agent's boots/time after an
+    # authenticated, timely message, and marks the clock as trusted.
+    param ([hashtable]$Session, [long]$Boots, [long]$Time)
+
+    if (-not $Session.TimeTrusted -or $Boots -gt $Session.EngineBoots -or
+        ($Boots -eq $Session.EngineBoots -and $Time -gt (Get-SnmpEngineTime -Session $Session))) {
+        $Session.EngineBoots = $Boots
+        $Session.EngineTime = $Time
+        $Session.EngineTimeSyncedAt = $Session.Clock.Elapsed.TotalSeconds
+        $Session.TimeTrusted = $true
+    }
 }
 
 function Set-SnmpV3Engine {
+    # Adopts an engine ID with a provisional boots/time estimate (trusted only once an
+    # authenticated message confirms it; see Update-SnmpV3Clock). When the engine ID changes the
+    # old localized keys are wiped and new ones derived from the master keys.
     param ([hashtable]$Session, [byte[]]$EngineId, [long]$Boots, [long]$Time)
 
-    $changed = $null -eq $Session.EngineId -or
-        [BitConverter]::ToString($Session.EngineId) -ne [BitConverter]::ToString($EngineId)
+    $changed = $null -eq $Session.EngineId -or -not (Test-SnmpBytesEqual $Session.EngineId $EngineId)
 
     $Session.EngineId = $EngineId
     $Session.EngineBoots = $Boots
     $Session.EngineTime = $Time
     $Session.EngineTimeSyncedAt = $Session.Clock.Elapsed.TotalSeconds
+    $Session.TimeTrusted = $false
 
-    if ($changed -and $EngineId.Length -gt 0) {
-        if ($Session.AuthMasterKey) {
+    if ($changed) {
+        Clear-SnmpBytes $Session.AuthKey
+        Clear-SnmpBytes $Session.PrivKey
+        $Session.AuthKey = $null
+        $Session.PrivKey = $null
+        if ($EngineId.Length -gt 0 -and $Session.AuthMasterKey) {
             $hashName = $script:SnmpAuthProtocols[$Session.AuthProtocol].Hash
             $Session.AuthKey = Get-SnmpLocalizedKey -HashName $hashName -Key $Session.AuthMasterKey -EngineId $EngineId
             if ($Session.PrivMasterKey) {
@@ -1516,25 +1869,65 @@ function Set-SnmpV3Engine {
 #region SNMP transport and request engine
 
 function ConvertTo-SnmpPasswordBytes {
+    # Returns @{ Bytes (UTF-8, module-owned: clear after use); Characters } or $null for $null.
+    # SecureString input is copied through a zeroed unmanaged buffer into a char array that is
+    # cleared here, so no immutable plaintext string is created. Plain strings are the caller's.
     param ($Value)
 
     if ($null -eq $Value) {
         return $null
     }
-    $plain = if ($Value -is [System.Security.SecureString]) {
-        [System.Net.NetworkCredential]::new('', $Value).Password
-    } elseif ($Value -is [System.Management.Automation.PSCredential]) {
-        $Value.GetNetworkCredential().Password
-    } else {
-        [string]$Value
+    if ($Value -is [System.Management.Automation.PSCredential]) {
+        $Value = $Value.Password
     }
-    if ([string]::IsNullOrEmpty($plain)) {
-        return $null
+
+    $chars = $null
+    try {
+        if ($Value -is [System.Security.SecureString]) {
+            $chars = [char[]]::new($Value.Length)
+            if ($Value.Length -gt 0) {
+                $pointer = [System.Runtime.InteropServices.Marshal]::SecureStringToGlobalAllocUnicode($Value)
+                try {
+                    [System.Runtime.InteropServices.Marshal]::Copy($pointer, $chars, 0, $chars.Length)
+                }
+                finally {
+                    [System.Runtime.InteropServices.Marshal]::ZeroFreeGlobalAllocUnicode($pointer)
+                }
+            }
+        } else {
+            $chars = ([string]$Value).ToCharArray()
+        }
+
+        # Count characters (Unicode scalar values), not UTF-16 units or UTF-8 bytes.
+        $characters = 0
+        foreach ($char in $chars) {
+            if (-not [char]::IsLowSurrogate($char)) {
+                $characters++
+            }
+        }
+        [PSCustomObject]@{
+            Bytes      = [System.Text.Encoding]::UTF8.GetBytes($chars)
+            Characters = $characters
+        }
     }
-    return , [System.Text.Encoding]::UTF8.GetBytes($plain)
+    finally {
+        Clear-SnmpBytes $chars
+    }
+}
+
+function Clear-SnmpSessionSecrets {
+    param ([hashtable]$Session)
+
+    foreach ($name in 'AuthMasterKey', 'PrivMasterKey', 'AuthKey', 'PrivKey', 'CommunityBytes') {
+        Clear-SnmpBytes $Session[$name]
+        $Session[$name] = $null
+    }
 }
 
 function New-SnmpSession {
+    # Builds a session after validating every security option against the requested version.
+    # Validation runs before name resolution or socket creation, so an inconsistent or empty
+    # credential can never fall back to a weaker protocol or reach the network.
     [CmdletBinding()]
     param (
         [Parameter(Mandatory = $true)]
@@ -1555,6 +1948,8 @@ function New-SnmpSession {
         [int]$Retries = 2
     )
 
+    $bound = $PSBoundParameters
+
     $switches = @()
     if ($V1) { $switches += '1' }
     if ($V2c) { $switches += '2c' }
@@ -1562,140 +1957,219 @@ function New-SnmpSession {
     if ($switches.Count -gt 1) {
         throw 'Specify only one of -V1, -V2c, or -V3.'
     }
+    if ($Version -eq '2') {
+        $Version = '2c'
+    }
     if ($switches.Count -eq 1) {
-        if ($Version -and ($Version -replace '^2$', '2c') -ne $switches[0]) {
+        if ($Version -and $Version -ne $switches[0]) {
             throw "-Version $Version conflicts with -V$($switches[0])."
         }
         $Version = $switches[0]
     }
+
+    # SNMPv3-only options: an explicit empty context is harmless and ignored.
+    $usmOptions = @('UserName', 'AuthProtocol', 'AuthPassword', 'PrivProtocol', 'PrivPassword', 'Context') |
+        Where-Object { $bound.ContainsKey($_) -and -not ($_ -eq 'Context' -and [string]::IsNullOrEmpty($Context)) }
+    $usmList = (@($usmOptions) | ForEach-Object { "-$_" }) -join ', '
+
+    if ($Version -in '1', '2c' -and @($usmOptions).Count -gt 0) {
+        throw "$usmList are SNMPv3 options and cannot be used with SNMP v$Version. Remove them, or use -V3."
+    }
+    if (@($usmOptions | Where-Object { $_ -ne 'UserName' }).Count -gt 0 -and -not $bound.ContainsKey('UserName')) {
+        throw "-UserName is required with $usmList."
+    }
+    if ($bound.ContainsKey('UserName') -and [string]::IsNullOrEmpty($UserName)) {
+        throw '-UserName cannot be empty.'
+    }
     if (-not $Version) {
-        $Version = if ($UserName) { '3' } else { '2c' }
+        $Version = if ($bound.ContainsKey('UserName')) { '3' } else { '2c' }
+    }
+    if ($Version -eq '3') {
+        if (-not $bound.ContainsKey('UserName')) {
+            throw 'SNMPv3 requires -UserName.'
+        }
+        if ($bound.ContainsKey('Community')) {
+            throw '-Community applies to SNMP v1/v2c; SNMPv3 authenticates with -UserName and its passwords.'
+        }
+        if ([System.Text.Encoding]::UTF8.GetByteCount($UserName) -gt 32) {
+            throw '-UserName must be at most 32 octets (UTF-8).'
+        }
     }
 
     $versionNumber = switch ($Version) {
         '1' { 0 }
-        '2' { 1 }
         '2c' { 1 }
         '3' { 3 }
         default { throw "Unsupported SNMP version '$Version'." }
     }
 
-    $address = $null
-    if (-not [System.Net.IPAddress]::TryParse($ComputerName, [ref]$address)) {
-        $candidates = @([System.Net.Dns]::GetHostAddresses($ComputerName))
-        $address = ($candidates | Where-Object AddressFamily -eq ([System.Net.Sockets.AddressFamily]::InterNetwork) | Select-Object -First 1) ?? $candidates[0]
-        if ($null -eq $address) {
-            throw "Could not resolve '$ComputerName'."
-        }
-    }
-
     $session = @{
         ComputerName   = $ComputerName
-        Endpoint       = [System.Net.IPEndPoint]::new($address, $Port)
         Version        = $versionNumber
         VersionLabel   = @{ 0 = 'v1'; 1 = 'v2c'; 3 = 'v3' }[$versionNumber]
         Community      = $Community
+        CommunityBytes = [System.Text.Encoding]::UTF8.GetBytes($Community)
         Context        = $Context
+        ContextBytes   = [System.Text.Encoding]::UTF8.GetBytes($Context)
         TimeoutMs      = $TimeoutMs
         Retries        = $Retries
         Window         = 8
         MaxVarbinds    = 24
         MaxRepetitions = 25
+        # Per-walk budget (see Invoke-SnmpWalk).
+        WalkLimits     = @{ Seconds = 60; Rows = 50000; Bytes = 16MB }
         NextId         = [System.Random]::new().Next(1, 0x3FFFFFFF)
         Clock          = [System.Diagnostics.Stopwatch]::StartNew()
         Socket         = $null
     }
 
-    if ($versionNumber -eq 3) {
-        if (-not $UserName) {
-            throw 'SNMPv3 requires -UserName.'
-        }
-        $authBytes = ConvertTo-SnmpPasswordBytes $AuthPassword
-        $privBytes = ConvertTo-SnmpPasswordBytes $PrivPassword
-        if ($privBytes -and -not $authBytes) {
-            throw 'SNMPv3 privacy (-PrivPassword) requires authentication (-AuthPassword).'
-        }
-        if ($AuthProtocol -and -not $authBytes) {
-            throw '-AuthProtocol was given without -AuthPassword.'
-        }
-        if ($PrivProtocol -and -not $privBytes) {
-            throw '-PrivProtocol was given without -PrivPassword.'
+    $authSecret = $null
+    $privSecret = $null
+    try {
+        if ($versionNumber -eq 3) {
+            $session.CommunityBytes = $null
+            $session.Community = $null
+            foreach ($name in 'AuthPassword', 'PrivPassword') {
+                if (-not $bound.ContainsKey($name)) { continue }
+                $secret = ConvertTo-SnmpPasswordBytes $bound[$name]
+                if ($null -eq $secret -or $secret.Characters -eq 0) {
+                    if ($null -ne $secret) { Clear-SnmpBytes $secret.Bytes }
+                    throw "-$name was supplied but is empty. Omit it to use a lower security level deliberately."
+                }
+                if ($secret.Characters -lt 8) {
+                    Clear-SnmpBytes $secret.Bytes
+                    throw "-$name must be at least 8 characters (RFC 3414)."
+                }
+                if ($name -eq 'AuthPassword') { $authSecret = $secret } else { $privSecret = $secret }
+            }
+            if ($privSecret -and -not $authSecret) {
+                throw 'SNMPv3 privacy (-PrivPassword) requires authentication (-AuthPassword).'
+            }
+            if ($bound.ContainsKey('AuthProtocol') -and -not $authSecret) {
+                throw '-AuthProtocol was given without -AuthPassword.'
+            }
+            if ($bound.ContainsKey('PrivProtocol') -and -not $privSecret) {
+                throw '-PrivProtocol was given without -PrivPassword.'
+            }
+
+            $session.UserName = $UserName
+            $session.UserNameBytes = [System.Text.Encoding]::UTF8.GetBytes($UserName)
+            $session.SecurityLevel = 'NoAuthNoPriv'
+            $session.EngineId = $null
+            $session.EngineBoots = 0
+            $session.EngineTime = 0
+            $session.EngineTimeSyncedAt = 0.0
+            $session.TimeTrusted = $false
+
+            if ($authSecret) {
+                # [string] parameters default to '' rather than $null, so ?? would never apply here.
+                $authName = $(if ($AuthProtocol) { $AuthProtocol } else { 'SHA' }).ToUpperInvariant() -replace '^SHA1$', 'SHA'
+                if (-not $script:SnmpAuthProtocols.ContainsKey($authName)) {
+                    throw "Unsupported SNMPv3 auth protocol '$AuthProtocol'."
+                }
+                $session.AuthProtocol = $authName
+                $session.AuthMasterKey = ConvertTo-SnmpUsmKey -HashName $script:SnmpAuthProtocols[$authName].Hash -Password $authSecret.Bytes
+                $session.SecurityLevel = 'AuthNoPriv'
+            }
+            if ($privSecret) {
+                $privName = $(if ($PrivProtocol) { $PrivProtocol } else { 'AES' }).ToUpperInvariant() -replace '^AES128$', 'AES'
+                if (-not $script:SnmpPrivProtocols.ContainsKey($privName)) {
+                    throw "Unsupported SNMPv3 privacy protocol '$PrivProtocol'."
+                }
+                $session.PrivProtocol = $privName
+                $session.PrivMasterKey = ConvertTo-SnmpUsmKey -HashName $script:SnmpAuthProtocols[$session.AuthProtocol].Hash -Password $privSecret.Bytes
+                $session.SecurityLevel = 'AuthPriv'
+            }
+            $session.VersionLabel = "v3 $($session.SecurityLevel)"
         }
 
-        $session.UserName = $UserName
-        $session.SecurityLevel = 'NoAuthNoPriv'
-        $session.EngineId = $null
-        $session.EngineBoots = 0
-        $session.EngineTime = 0
-        $session.EngineTimeSyncedAt = 0.0
-        $saltSeed = [byte[]]::new(8)
-        [System.Random]::new().NextBytes($saltSeed)
-        $session.SaltCounter = [BitConverter]::ToUInt64($saltSeed, 0)
+        $address = $null
+        if (-not [System.Net.IPAddress]::TryParse($ComputerName, [ref]$address)) {
+            $candidates = @([System.Net.Dns]::GetHostAddresses($ComputerName))
+            $address = ($candidates | Where-Object AddressFamily -eq ([System.Net.Sockets.AddressFamily]::InterNetwork) | Select-Object -First 1) ?? $candidates[0]
+            if ($null -eq $address) {
+                throw "Could not resolve '$ComputerName'."
+            }
+        }
+        $session.Endpoint = [System.Net.IPEndPoint]::new($address, $Port)
 
-        if ($authBytes) {
-            # [string] parameters default to '' rather than $null, so ?? would never apply here.
-            $authName = $(if ($AuthProtocol) { $AuthProtocol } else { 'SHA' }).ToUpperInvariant() -replace '^SHA1$', 'SHA'
-            if (-not $script:SnmpAuthProtocols.ContainsKey($authName)) {
-                throw "Unsupported SNMPv3 auth protocol '$AuthProtocol'."
+        # A connected socket only receives datagrams from the agent's address and port; the
+        # receive path checks the sender again in case the platform does not filter.
+        $socket = [System.Net.Sockets.UdpClient]::new($address.AddressFamily)
+        $session.Socket = $socket
+        if ($IsWindows) {
+            # Stop ICMP port-unreachable from surfacing as ConnectionReset on later receives (SIO_UDP_CONNRESET).
+            try {
+                [void]$socket.Client.IOControl(-1744830452, [byte[]]@(0, 0, 0, 0), $null)
             }
-            if ($authBytes.Length -lt 8) {
-                Write-Warning 'SNMPv3 auth password is shorter than 8 characters; most agents will reject it.'
+            catch {
             }
-            $session.AuthProtocol = $authName
-            $session.AuthMasterKey = ConvertTo-SnmpUsmKey -HashName $script:SnmpAuthProtocols[$authName].Hash -Password $authBytes
-            $session.SecurityLevel = 'AuthNoPriv'
         }
-        if ($privBytes) {
-            $privName = $(if ($PrivProtocol) { $PrivProtocol } else { 'AES' }).ToUpperInvariant() -replace '^AES128$', 'AES'
-            if (-not $script:SnmpPrivProtocols.ContainsKey($privName)) {
-                throw "Unsupported SNMPv3 privacy protocol '$PrivProtocol'."
-            }
-            if ($privBytes.Length -lt 8) {
-                Write-Warning 'SNMPv3 privacy password is shorter than 8 characters; most agents will reject it.'
-            }
-            $session.PrivProtocol = $privName
-            $session.PrivMasterKey = ConvertTo-SnmpUsmKey -HashName $script:SnmpAuthProtocols[$session.AuthProtocol].Hash -Password $privBytes
-            $session.SecurityLevel = 'AuthPriv'
-        }
-        $session.VersionLabel = "v3 $($session.SecurityLevel)"
+        $socket.Connect($session.Endpoint)
+        return $session
     }
-
-    $socket = [System.Net.Sockets.UdpClient]::new($address.AddressFamily)
-    if ($IsWindows) {
-        # Stop ICMP port-unreachable from surfacing as ConnectionReset on later receives (SIO_UDP_CONNRESET).
-        try {
-            [void]$socket.Client.IOControl(-1744830452, [byte[]]@(0, 0, 0, 0), $null)
+    catch {
+        Clear-SnmpSessionSecrets $session
+        if ($null -ne $session.Socket) {
+            $session.Socket.Dispose()
+            $session.Socket = $null
         }
-        catch {
+        throw
+    }
+    finally {
+        foreach ($secret in $authSecret, $privSecret) {
+            if ($null -ne $secret) { Clear-SnmpBytes $secret.Bytes }
         }
     }
-    $session.Socket = $socket
-    return $session
 }
 
 function Close-SnmpSession {
+    # Disposes the socket and wipes the session's master keys, localized keys and community.
     param ([hashtable]$Session)
 
-    if ($null -ne $Session -and $null -ne $Session.Socket) {
+    if ($null -eq $Session) {
+        return
+    }
+    if ($null -ne $Session.Socket) {
         $Session.Socket.Dispose()
         $Session.Socket = $null
     }
+    Clear-SnmpSessionSecrets $Session
 }
 
 function New-SnmpRequestId {
     param ([hashtable]$Session)
 
     $Session.NextId = if ($Session.NextId -ge 0x7FFFFFF0) { 1 } else { $Session.NextId + 1 }
-    return $Session.NextId
+    return [int]$Session.NextId
 }
 
 function Send-SnmpDatagram {
     param ([hashtable]$Session, [byte[]]$Bytes)
 
-    [void]$Session.Socket.Send($Bytes, $Bytes.Length, $Session.Endpoint)
+    # The socket is connected to the agent, so the endpoint-less overload is used. On Linux an ICMP
+    # port-unreachable for an earlier datagram is reported by the next send as ConnectionRefused
+    # (Windows has this switched off with SIO_UDP_CONNRESET). That reports the earlier datagram, so
+    # send again; if the port keeps refusing, drop the datagram and let the request time out with
+    # the usual message rather than surfacing a raw socket error.
+    for ($attempt = 0; $attempt -lt 2; $attempt++) {
+        try {
+            [void]$Session.Socket.Send($Bytes, $Bytes.Length)
+            return
+        }
+        catch [System.Net.Sockets.SocketException] {
+            $code = $_.Exception.SocketErrorCode
+            if ($code -ne [System.Net.Sockets.SocketError]::ConnectionRefused -and $code -ne [System.Net.Sockets.SocketError]::ConnectionReset) {
+                throw
+            }
+            Write-Verbose "The agent at $($Session.Endpoint) refused an earlier datagram (ICMP port unreachable)."
+        }
+    }
 }
 
 function Receive-SnmpDatagram {
+    # Returns the next datagram from the session's agent (address and port), or $null at the
+    # deadline. Datagrams from anywhere else are discarded unread.
     param ([hashtable]$Session, [long]$TimeoutMs)
 
     $deadline = $Session.Clock.ElapsedMilliseconds + [Math]::Max(0, $TimeoutMs)
@@ -1712,18 +2186,29 @@ function Receive-SnmpDatagram {
         }
         try {
             $remote = [System.Net.IPEndPoint]::new($anyAddress, 0)
-            return , $Session.Socket.Receive([ref]$remote)
+            $bytes = $Session.Socket.Receive([ref]$remote)
         }
         catch [System.Net.Sockets.SocketException] {
+            # ICMP errors (port unreachable) surface here on some platforms; keep waiting.
             if ($remaining -le 0) {
                 return $null
             }
+            continue
+        }
+        if ($remote.Port -eq $Session.Endpoint.Port -and $remote.Address.Equals($Session.Endpoint.Address)) {
+            return , $bytes
+        }
+        Write-Verbose "Ignoring a datagram from $remote (expected $($Session.Endpoint))."
+        if ($remaining -le 0) {
+            return $null
         }
     }
 }
 
 function ConvertTo-SnmpRequestMessage {
-    param ([hashtable]$Session, $Request, [int]$Id)
+    # Encodes one attempt of a request. For v3 the outer msgID ($MsgId) is fresh per attempt while
+    # the PDU request-id ($RequestId) stays the same for the logical request.
+    param ([hashtable]$Session, $Request, [int]$RequestId, [int]$MsgId)
 
     $errorStatus = 0
     $errorIndex = 0
@@ -1745,55 +2230,207 @@ function ConvertTo-SnmpRequestMessage {
         $varbindList = ConvertTo-SnmpVarbindListTlv -Varbinds @($Request.Oids)
         $Session.VarbindCache[$cacheKey] = $varbindList
     }
-    $pdu = ConvertTo-SnmpPduBytes -PduType $Request.PduType -RequestId $Id -ErrorStatus $errorStatus -ErrorIndex $errorIndex -VarbindList $varbindList
+    $pdu = ConvertTo-SnmpPduBytes -PduType $Request.PduType -RequestId $RequestId -ErrorStatus $errorStatus -ErrorIndex $errorIndex -VarbindList $varbindList
 
     if ($Session.Version -eq 3) {
-        return , (ConvertTo-SnmpV3Message -Session $Session -MsgId $Id -Pdu $pdu)
+        return , (ConvertTo-SnmpV3Message -Session $Session -MsgId $MsgId -Pdu $pdu)
     }
     return , (ConvertTo-SnmpCommunityMessage -Version $Session.Version -Community $Session.Community -Pdu $pdu)
 }
 
-function ConvertFrom-SnmpResponse {
-    param ([hashtable]$Session, [byte[]]$Data)
+function Get-SnmpReportMessage {
+    param ([hashtable]$Session, [string]$Report)
 
-    $message = ConvertFrom-SnmpMessage -Data $Data
+    $target = $Session.ComputerName
+    switch ($Report) {
+        'unknownUserNames' { return "SNMPv3 user '$($Session.UserName)' is not known to $target." }
+        'wrongDigests' { return "SNMPv3 authentication failed on $target (wrong auth password or auth protocol)." }
+        'decryptionErrors' { return "SNMPv3 decryption failed on $target (wrong privacy password or privacy protocol)." }
+        'unsupportedSecLevels' { return "$target does not allow security level $($Session.SecurityLevel) for user '$($Session.UserName)'." }
+        'unknownEngineIDs' { return "$target reported an unknown SNMPv3 engine ID (the agent's engine may have changed)." }
+        'notInTimeWindows' { return "$target reported the request as outside its SNMPv3 time window." }
+    }
+    return "SNMP agent $target returned report $Report."
+}
+
+function Get-SnmpTimeoutMessage {
+    param ([hashtable]$Session, [hashtable]$Entry)
+
+    $target = "$($Session.ComputerName):$($Session.Endpoint.Port)"
+    if ($Entry.Hint) {
+        $detail = Get-SnmpReportMessage -Session $Session -Report $Entry.Hint
+        return "$detail No authenticated reply from $target after $($Entry.Attempts) attempts; the agent's report was not authenticated."
+    }
+    return "No SNMP response from $target after $($Entry.Attempts) attempts (check reachability, version, and credentials)."
+}
+
+function Test-SnmpResponseShape {
+    # Does a Response-PDU carry the bindings its request allows (RFC 3416 §4.2)? A successful GET
+    # must return exactly the requested OIDs in order; GetNext one binding per name; GetBulk no
+    # more than non-repeaters + max-repetitions * repeaters. Error responses only need an
+    # error-index that points into the request.
+    param ($Request, $Pdu)
+
+    $requested = @($Request.Oids)
+    if ($Pdu.ErrorStatus -lt 0 -or $Pdu.ErrorStatus -ge $script:SnmpErrorNames.Count) {
+        return $false
+    }
+    if ($Pdu.ErrorStatus -ne 0) {
+        return ($Pdu.ErrorIndex -ge 0 -and $Pdu.ErrorIndex -le $requested.Count)
+    }
+
+    $bindings = @($Pdu.Varbinds)
+    switch ($Request.PduType) {
+        0xA0 {
+            if ($bindings.Count -ne $requested.Count) {
+                return $false
+            }
+            for ($i = 0; $i -lt $requested.Count; $i++) {
+                if ($bindings[$i].Oid -cne ([string]$requested[$i]).TrimStart('.')) {
+                    return $false
+                }
+            }
+            return $true
+        }
+        0xA1 {
+            return $bindings.Count -eq $requested.Count
+        }
+        0xA5 {
+            $nonRepeaters = [Math]::Min([Math]::Max(0, [int]($Request.NonRepeaters ?? 0)), $requested.Count)
+            $repetitions = [Math]::Max(0, [int]($Request.MaxRepetitions ?? 0))
+            return $bindings.Count -le ($nonRepeaters + $repetitions * ($requested.Count - $nonRepeaters))
+        }
+    }
+    return $true
+}
+
+function Read-SnmpExchangeReply {
+    <#
+    Decides what one datagram from the agent means for the pending requests. Returns $null to
+    ignore it (the request stays pending), or an object with Entry and Action:
+      Complete  - Pdu answers the request
+      Resend    - resend the request with a fresh msgID (authenticated time resync, or engine
+                  rediscovery on a noAuthNoPriv session)
+      Hint      - an unauthenticated Report; kept only to explain a later timeout
+      Fail      - Message is an authoritative error
+
+    Order of checks: correlate (community or msgID) -> authenticate (engine, user, MAC,
+    freshness) -> decrypt -> PDU type, security level, identity, context, request-id -> decode
+    varbinds -> binding shape. Nothing is decoded beyond the envelope until the reply is
+    correlated and, where the session is protected, authenticated.
+    #>
+    param ([hashtable]$Session, [byte[]]$Data, [hashtable]$Pending)
+
+    $message = ConvertFrom-SnmpMessage -Data $Data -Envelope
     if ($message.Version -ne $Session.Version) {
         return $null
     }
+
     if ($Session.Version -ne 3) {
-        return [PSCustomObject]@{ Id = $message.MsgId; Pdu = $message.Pdu; Message = $message }
+        if (-not (Test-SnmpBytesEqual $message.CommunityBytes $Session.CommunityBytes)) {
+            return $null
+        }
+        $header = $message.Pdu
+        $entry = $Pending[[int]$header.RequestId]
+        # Reports are an SNMPv3 mechanism; only a Response answers a community request.
+        if ($null -eq $entry -or $header.PduType -ne $script:SnmpPduTypes.Response) {
+            return $null
+        }
+        $pdu = Complete-SnmpPdu $header
+        if (-not (Test-SnmpResponseShape -Request $entry.Request -Pdu $pdu)) {
+            return $null
+        }
+        return [PSCustomObject]@{ Entry = $entry; Action = 'Complete'; Pdu = $pdu }
     }
-    $scoped = Resolve-SnmpV3Message -Session $Session -Data $Data -Message $message
-    return [PSCustomObject]@{ Id = $message.MsgId; Pdu = $scoped.Pdu; Message = $message }
+
+    $entry = $Pending[[int]$message.MsgId]
+    if ($null -eq $entry) {
+        return $null
+    }
+    $auth = ($message.Flags -band 0x01) -ne 0
+    $priv = ($message.Flags -band 0x02) -ne 0
+    if ($priv -and -not $auth) {
+        return $null
+    }
+    $sameEngine = $null -ne $Session.EngineId -and (Test-SnmpBytesEqual $message.EngineId $Session.EngineId)
+    $sameUser = Test-SnmpBytesEqual $message.UserNameBytes $Session.UserNameBytes
+
+    if ($auth) {
+        if (-not ($sameEngine -and $sameUser)) {
+            return $null
+        }
+        if (-not (Test-SnmpV3Mac -Session $Session -Data $Data -Message $message)) {
+            return $null
+        }
+        if (-not (Test-SnmpV3Timeliness -Session $Session -Boots $message.EngineBoots -Time $message.EngineTime)) {
+            Write-Verbose 'Ignoring an authenticated SNMPv3 message outside the time window.'
+            return $null
+        }
+        $scoped = if ($priv) { Get-SnmpV3DecryptedScopedPdu -Session $Session -Message $message -HeaderOnly } else { $message.ScopedPdu }
+    } else {
+        $scoped = $message.ScopedPdu
+    }
+    if ($null -eq $scoped) {
+        return $null
+    }
+    $header = $scoped.Pdu
+
+    if ($header.PduType -eq $script:SnmpPduTypes.Report) {
+        $bindings = @((Complete-SnmpPdu $header).Varbinds)
+        $report = if ($bindings.Count -gt 0) { $script:SnmpUsmReports[$bindings[0].Oid] ?? $bindings[0].Oid } else { 'an empty report' }
+
+        if ($auth) {
+            # Authenticated for this engine and user (an authNoPriv Report may answer an authPriv
+            # request), so it can be acted on.
+            if ($report -eq 'notInTimeWindows') {
+                Update-SnmpV3Clock -Session $Session -Boots $message.EngineBoots -Time $message.EngineTime
+                return [PSCustomObject]@{ Entry = $entry; Action = 'Resend' }
+            }
+            return [PSCustomObject]@{ Entry = $entry; Action = 'Fail'; Message = (Get-SnmpReportMessage -Session $Session -Report $report) }
+        }
+
+        if ($Session.SecurityLevel -eq 'NoAuthNoPriv') {
+            # Nothing at this security level can be authenticated, so Reports are taken at face value.
+            if ($report -eq 'unknownEngineIDs' -and $message.EngineId.Length -ge 5) {
+                Set-SnmpV3Engine -Session $Session -EngineId $message.EngineId -Boots $message.EngineBoots -Time $message.EngineTime
+                return [PSCustomObject]@{ Entry = $entry; Action = 'Resend' }
+            }
+            return [PSCustomObject]@{ Entry = $entry; Action = 'Fail'; Message = (Get-SnmpReportMessage -Session $Session -Report $report) }
+        }
+
+        # An unauthenticated Report against a protected session changes nothing: no engine, key or
+        # clock update and no retry. It only explains the failure if no valid reply arrives.
+        return [PSCustomObject]@{ Entry = $entry; Action = 'Hint'; Hint = $report }
+    }
+
+    if ($header.PduType -ne $script:SnmpPduTypes.Response) {
+        return $null
+    }
+    $level = if ($priv) { 'AuthPriv' } elseif ($auth) { 'AuthNoPriv' } else { 'NoAuthNoPriv' }
+    if ($level -ne $Session.SecurityLevel -or -not $sameEngine -or -not $sameUser) {
+        return $null
+    }
+    if (-not (Test-SnmpBytesEqual $scoped.ContextEngineId $Session.EngineId) -or
+        -not (Test-SnmpBytesEqual $scoped.ContextNameBytes $Session.ContextBytes)) {
+        return $null
+    }
+    if ([int]$header.RequestId -ne [int]$entry.RequestId) {
+        return $null
+    }
+    $pdu = Complete-SnmpPdu $header
+    if (-not (Test-SnmpResponseShape -Request $entry.Request -Pdu $pdu)) {
+        return $null
+    }
+    if ($auth) {
+        Update-SnmpV3Clock -Session $Session -Boots $message.EngineBoots -Time $message.EngineTime
+    }
+    return [PSCustomObject]@{ Entry = $entry; Action = 'Complete'; Pdu = $pdu }
 }
 
-function Resolve-SnmpReport {
-    # Handles a v3 Report PDU. Returns when the request should be resent; throws otherwise.
-    param ([hashtable]$Session, $Response)
-
-    $varbind = @($Response.Pdu.Varbinds)[0]
-    $report = if ($varbind) { $script:SnmpUsmReports[$varbind.Oid] } else { $null }
-    $target = $Session.ComputerName
-
-    switch ($report) {
-        'notInTimeWindows' {
-            Set-SnmpV3Engine -Session $Session -EngineId $Response.Message.EngineId -Boots $Response.Message.EngineBoots -Time $Response.Message.EngineTime
-            return
-        }
-        'unknownEngineIDs' {
-            Set-SnmpV3Engine -Session $Session -EngineId $Response.Message.EngineId -Boots $Response.Message.EngineBoots -Time $Response.Message.EngineTime
-            return
-        }
-        'unknownUserNames' { throw "SNMPv3 user '$($Session.UserName)' is not known to $target." }
-        'wrongDigests' { throw "SNMPv3 authentication failed on $target (wrong auth password or auth protocol)." }
-        'decryptionErrors' { throw "SNMPv3 decryption failed on $target (wrong privacy password or privacy protocol)." }
-        'unsupportedSecLevels' { throw "$target does not allow security level $($Session.SecurityLevel) for user '$($Session.UserName)'." }
-    }
-    throw "SNMP agent $target returned report $($varbind.Oid)."
-}
-
-function Initialize-SnmpV3Engine {
-    # RFC 3414 4: discover the authoritative engine ID (plus boots/time) with an empty noAuthNoPriv request.
+function Find-SnmpV3Engine {
+    # RFC 3414 §4 discovery: an empty noAuthNoPriv request should draw a usmStatsUnknownEngineIDs
+    # Report naming the agent's engine. Only that Report, from the session's peer and for this
+    # request's msgID, is accepted. Its boots/time are provisional until an authenticated reply.
     param ([hashtable]$Session)
 
     for ($attempt = 0; $attempt -le $Session.Retries; $attempt++) {
@@ -1808,24 +2445,38 @@ function Initialize-SnmpV3Engine {
                 break
             }
             try {
-                $message = ConvertFrom-SnmpMessage -Data $data
+                $message = ConvertFrom-SnmpMessage -Data $data -Envelope
+                if ($message.Version -ne 3 -or $message.MsgId -ne $id -or ($message.Flags -band 0x03) -ne 0 -or
+                    $null -eq $message.ScopedPdu -or $message.ScopedPdu.Pdu.PduType -ne $script:SnmpPduTypes.Report -or
+                    $message.EngineId.Length -lt 5) {
+                    continue
+                }
+                $bindings = @((Complete-SnmpPdu $message.ScopedPdu.Pdu).Varbinds)
+                if ($bindings.Count -ge 1 -and $script:SnmpUsmReports[$bindings[0].Oid] -eq 'unknownEngineIDs') {
+                    return [PSCustomObject]@{ EngineId = $message.EngineId; Boots = $message.EngineBoots; Time = $message.EngineTime }
+                }
             }
             catch {
-                Write-Verbose "Ignoring malformed SNMP datagram: $($_.Exception.Message)"
-                continue
-            }
-            if ($message.Version -eq 3 -and $message.MsgId -eq $id -and $message.EngineId.Length -gt 0) {
-                Set-SnmpV3Engine -Session $Session -EngineId $message.EngineId -Boots $message.EngineBoots -Time $message.EngineTime
-                return
+                Write-Verbose "Ignoring SNMP datagram during engine discovery: $($_.Exception.Message)"
             }
         }
     }
     throw "No SNMPv3 response from $($Session.ComputerName):$($Session.Endpoint.Port) (engine discovery timed out)."
 }
 
+function Initialize-SnmpV3Engine {
+    param ([hashtable]$Session)
+
+    $engine = Find-SnmpV3Engine -Session $Session
+    Set-SnmpV3Engine -Session $Session -EngineId $engine.EngineId -Boots $engine.Boots -Time $engine.Time
+}
+
 function Invoke-SnmpExchange {
-    # Sends a set of requests with up to $Session.Window outstanding at once and returns the
-    # response PDUs in request order. Each request is @{ PduType; Oids; [NonRepeaters]; [MaxRepetitions] }.
+    # Sends requests with up to $Session.Window outstanding and returns the Response PDUs in
+    # request order. Each request is @{ PduType; Oids; [NonRepeaters]; [MaxRepetitions] }.
+    # Every attempt of a v3 request gets a fresh msgID (earlier attempts are retired) while the
+    # PDU request-id stays fixed. Replies that fail Read-SnmpExchangeReply leave the request
+    # pending until its deadline.
     param ([hashtable]$Session, [object[]]$Requests)
 
     if ($Session.Version -eq 3 -and $null -eq $Session.EngineId) {
@@ -1834,63 +2485,105 @@ function Invoke-SnmpExchange {
 
     $count = $Requests.Count
     $results = [object[]]::new($count)
-    $inflight = @{}
+    $pending = @{}
+    $active = [System.Collections.Generic.List[hashtable]]::new()
     $next = 0
     $completed = 0
+    $rediscovered = $false
+
+    $send = {
+        param ([hashtable]$Entry)
+        if ($null -ne $Entry.Key) {
+            $pending.Remove($Entry.Key)
+        }
+        $msgId = if ($Session.Version -eq 3) { New-SnmpRequestId -Session $Session } else { $Entry.RequestId }
+        $bytes = ConvertTo-SnmpRequestMessage -Session $Session -Request $Entry.Request -RequestId $Entry.RequestId -MsgId $msgId
+        $Entry.Key = $msgId
+        $pending[$msgId] = $Entry
+        $Entry.Deadline = $Session.Clock.ElapsedMilliseconds + $Session.TimeoutMs
+        Send-SnmpDatagram -Session $Session -Bytes $bytes
+    }
 
     while ($completed -lt $count) {
-        while ($inflight.Count -lt $Session.Window -and $next -lt $count) {
-            $id = New-SnmpRequestId -Session $Session
-            Send-SnmpDatagram -Session $Session -Bytes (ConvertTo-SnmpRequestMessage -Session $Session -Request $Requests[$next] -Id $id)
-            $inflight[$id] = @{
-                Index    = $next
-                Attempts = 1
-                Reports  = 0
-                Deadline = $Session.Clock.ElapsedMilliseconds + $Session.TimeoutMs
+        while ($active.Count -lt $Session.Window -and $next -lt $count) {
+            $entry = @{
+                Index     = $next
+                Request   = $Requests[$next]
+                RequestId = New-SnmpRequestId -Session $Session
+                Key       = $null
+                Attempts  = 1
+                Reports   = 0
+                Hint      = $null
+                Deadline  = 0
             }
+            $active.Add($entry)
+            & $send $entry
             $next++
         }
 
-        $nearest = ($inflight.Values | Measure-Object -Property Deadline -Minimum).Minimum
+        $nearest = ($active | ForEach-Object { $_.Deadline } | Measure-Object -Minimum).Minimum
         $data = Receive-SnmpDatagram -Session $Session -TimeoutMs ($nearest - $Session.Clock.ElapsedMilliseconds)
         if ($null -ne $data) {
-            $response = $null
+            $reply = $null
             try {
-                $response = ConvertFrom-SnmpResponse -Session $Session -Data $data
+                $reply = Read-SnmpExchangeReply -Session $Session -Data $data -Pending $pending
             }
             catch {
                 Write-Verbose "Ignoring SNMP datagram: $($_.Exception.Message)"
             }
 
-            if ($null -ne $response -and $inflight.ContainsKey($response.Id)) {
-                $entry = $inflight[$response.Id]
-                if ($response.Pdu.PduType -eq $script:SnmpPduTypes.Report) {
-                    Resolve-SnmpReport -Session $Session -Response $response
-                    $entry.Reports++
-                    if ($entry.Reports -gt 3) {
-                        throw "SNMPv3 agent $($Session.ComputerName) keeps rejecting requests (time window / engine ID never converged)."
+            if ($null -ne $reply) {
+                $entry = $reply.Entry
+                switch ($reply.Action) {
+                    'Complete' {
+                        $results[$entry.Index] = $reply.Pdu
+                        $pending.Remove($entry.Key)
+                        [void]$active.Remove($entry)
+                        $completed++
                     }
-                    Send-SnmpDatagram -Session $Session -Bytes (ConvertTo-SnmpRequestMessage -Session $Session -Request $Requests[$entry.Index] -Id $response.Id)
-                    $entry.Deadline = $Session.Clock.ElapsedMilliseconds + $Session.TimeoutMs
-                } else {
-                    $results[$entry.Index] = $response.Pdu
-                    $inflight.Remove($response.Id)
-                    $completed++
+                    'Resend' {
+                        $entry.Reports++
+                        if ($entry.Reports -gt 3) {
+                            throw "SNMPv3 agent $($Session.ComputerName) keeps rejecting requests (time window / engine ID never converged)."
+                        }
+                        & $send $entry
+                    }
+                    'Hint' {
+                        $entry.Hint = $reply.Hint
+                    }
+                    'Fail' {
+                        throw $reply.Message
+                    }
                 }
             }
         }
 
         $now = $Session.Clock.ElapsedMilliseconds
-        foreach ($id in @($inflight.Keys)) {
-            $entry = $inflight[$id]
-            if ($now -ge $entry.Deadline) {
-                if ($entry.Attempts -gt $Session.Retries) {
-                    throw "No SNMP response from $($Session.ComputerName):$($Session.Endpoint.Port) after $($entry.Attempts) attempts (check reachability, version, and credentials)."
-                }
-                Send-SnmpDatagram -Session $Session -Bytes (ConvertTo-SnmpRequestMessage -Session $Session -Request $Requests[$entry.Index] -Id $id)
-                $entry.Attempts++
-                $entry.Deadline = $now + $Session.TimeoutMs
+        foreach ($entry in @($active)) {
+            if ($now -lt $entry.Deadline) {
+                continue
             }
+            if ($entry.Attempts -gt $Session.Retries) {
+                # Unauthenticated unknownEngineIDs Reports may mean the agent's engine really
+                # changed. Rediscover once; a new engine is adopted provisionally and must then
+                # answer with valid authentication.
+                if ($Session.Version -eq 3 -and $entry.Hint -eq 'unknownEngineIDs' -and -not $rediscovered) {
+                    $rediscovered = $true
+                    $candidate = Find-SnmpV3Engine -Session $Session
+                    if (-not (Test-SnmpBytesEqual $candidate.EngineId $Session.EngineId)) {
+                        Set-SnmpV3Engine -Session $Session -EngineId $candidate.EngineId -Boots $candidate.Boots -Time $candidate.Time
+                        foreach ($other in @($active)) {
+                            $other.Attempts = 1
+                            $other.Hint = $null
+                            & $send $other
+                        }
+                        break
+                    }
+                }
+                throw (Get-SnmpTimeoutMessage -Session $Session -Entry $entry)
+            }
+            $entry.Attempts++
+            & $send $entry
         }
     }
 
@@ -1908,6 +2601,7 @@ function Get-SnmpErrorName {
 
 function Invoke-SnmpGet {
     # Fetches many OIDs, batching varbinds per request. Returns a hashtable of OID -> varbind.
+    # Each successful batch has already been checked to contain exactly its requested OIDs.
     param ([hashtable]$Session, [string[]]$Oid)
 
     $results = @{}
@@ -1966,16 +2660,45 @@ function Invoke-SnmpGet {
     return $results
 }
 
+function ConvertTo-SnmpOidArcs {
+    param ([string]$Oid)
+
+    return , [uint64[]]($Oid.TrimStart('.').Split('.'))
+}
+
+function Compare-SnmpOid {
+    # Numeric (not string) OID order: -1, 0 or 1.
+    param ([uint64[]]$Left, [uint64[]]$Right)
+
+    $shared = [Math]::Min($Left.Count, $Right.Count)
+    for ($i = 0; $i -lt $shared; $i++) {
+        if ($Left[$i] -lt $Right[$i]) { return -1 }
+        if ($Left[$i] -gt $Right[$i]) { return 1 }
+    }
+    return $Left.Count.CompareTo($Right.Count)
+}
+
 function Invoke-SnmpWalk {
-    param ([hashtable]$Session, [string]$RootOid)
+    # Walks the subtree under $RootOid with GetNext (v1) or GetBulk. Every returned OID must be
+    # numerically greater than the previous one, and the walk is bounded by $Session.WalkLimits
+    # (elapsed seconds, rows, retained bytes). Exceeding a limit or going backwards throws rather
+    # than returning a partial table that could pass for a complete one.
+    param ([hashtable]$Session, [string]$RootOid, [string]$Name)
 
     $root = $RootOid.TrimStart('.')
-    $prefix = "$root."
+    $label = if ($Name) { "$Name ($root)" } else { $root }
+    $rootArcs = ConvertTo-SnmpOidArcs $root
+    $limits = $Session.WalkLimits ?? @{ Seconds = 60; Rows = 50000; Bytes = 16MB }
+    $watch = [System.Diagnostics.Stopwatch]::StartNew()
     $results = [System.Collections.Generic.List[object]]::new()
-    $seen = [System.Collections.Generic.HashSet[string]]::new()
+    $retainedBytes = 0
     $current = $root
+    $lastArcs = $rootArcs
 
     while ($true) {
+        if ($watch.Elapsed.TotalSeconds -gt $limits.Seconds) {
+            throw "SNMP walk of $label on $($Session.ComputerName) exceeded its $($limits.Seconds)-second limit after $($results.Count) rows; the table is incomplete."
+        }
         $request = if ($Session.Version -eq 0) {
             @{ PduType = $script:SnmpPduTypes.GetNext; Oids = @($current) }
         } else {
@@ -1991,26 +2714,49 @@ function Invoke-SnmpWalk {
             continue
         }
         if ($pdu.ErrorStatus -ne 0) {
-            throw "SNMP agent $($Session.ComputerName) returned error '$(Get-SnmpErrorName $pdu.ErrorStatus)' walking $root."
+            throw "SNMP agent $($Session.ComputerName) returned error '$(Get-SnmpErrorName $pdu.ErrorStatus)' walking $label."
         }
         if ($pdu.Varbinds.Count -eq 0) {
             break
         }
 
+        $batch = [System.Collections.Generic.List[object]]::new()
+        $batchBytes = 0
         $finished = $false
         foreach ($varbind in $pdu.Varbinds) {
-            if ($varbind.Type -in 'EndOfMibView', 'NoSuchObject', 'NoSuchInstance' -or
-                -not $varbind.Oid.StartsWith($prefix, [System.StringComparison]::Ordinal) -or
-                -not $seen.Add($varbind.Oid)) {
+            if ($varbind.Type -in 'EndOfMibView', 'NoSuchObject', 'NoSuchInstance') {
                 $finished = $true
                 break
             }
-            $results.Add($varbind)
-            $current = $varbind.Oid
+            $arcs = ConvertTo-SnmpOidArcs $varbind.Oid
+            $prefix = [uint64[]]($arcs[0..($rootArcs.Count - 1)])
+            $inSubtree = $arcs.Count -gt $rootArcs.Count -and (Compare-SnmpOid $prefix $rootArcs) -eq 0
+            if (-not $inSubtree) {
+                $finished = $true
+                break
+            }
+            if ((Compare-SnmpOid $arcs $lastArcs) -le 0) {
+                throw "SNMP agent $($Session.ComputerName) returned $($varbind.Oid) out of order while walking $label; the table is incomplete."
+            }
+            $lastArcs = $arcs
+            $valueBytes = if ($varbind.Value -is [byte[]]) { $varbind.Value.Length } else { 16 }
+            $batchBytes += 2 * $varbind.Oid.Length + $valueBytes + 64
+            $batch.Add($varbind)
         }
-        if ($finished) {
+
+        # Check the budget before keeping the batch.
+        if ($results.Count + $batch.Count -gt $limits.Rows) {
+            throw "SNMP walk of $label on $($Session.ComputerName) exceeded its $($limits.Rows)-row limit; the table is incomplete."
+        }
+        if ($retainedBytes + $batchBytes -gt $limits.Bytes) {
+            throw "SNMP walk of $label on $($Session.ComputerName) exceeded its $($limits.Bytes)-byte limit; the table is incomplete."
+        }
+        $results.AddRange($batch)
+        $retainedBytes += $batchBytes
+        if ($finished -or $batch.Count -eq 0) {
             break
         }
+        $current = $batch[$batch.Count - 1].Oid
     }
 
     return , $results.ToArray()
@@ -2078,15 +2824,39 @@ function Get-SnmpSessionParameter {
     return $selected
 }
 
+function Get-SnmpTypedValue {
+    # Returns a varbind's value only when it has the SMI type the MIB defines for the object and,
+    # for numbers, lies within the given range. Anything else is $null and treated as unavailable.
+    param ($Varbind, [string[]]$Type, $Minimum = $null, $Maximum = $null)
+
+    if ($null -eq $Varbind -or $Varbind.Type -notin $Type) {
+        return $null
+    }
+    $value = $Varbind.Value
+    if ($null -ne $Minimum -and $value -lt $Minimum) {
+        return $null
+    }
+    if ($null -ne $Maximum -and $value -gt $Maximum) {
+        return $null
+    }
+    return , $value
+}
+
 function Get-SnmpColumn {
-    # Walks a table column and returns a hashtable of ifIndex -> value.
-    param ([hashtable]$Session, [string]$ColumnOid)
+    # Walks a table column and returns a hashtable of index -> value, keeping only values with the
+    # expected SMI type and range.
+    param ([hashtable]$Session, [string]$ColumnOid, [string[]]$Type, $Minimum = $null, $Maximum = $null, [string]$Name)
 
     $map = @{}
-    foreach ($varbind in (Invoke-SnmpWalk -Session $Session -RootOid $ColumnOid)) {
+    foreach ($varbind in (Invoke-SnmpWalk -Session $Session -RootOid $ColumnOid -Name $Name)) {
         $index = 0
-        if ([int]::TryParse($varbind.Oid.Substring($ColumnOid.Length + 1), [ref]$index)) {
-            $map[$index] = $varbind.Value
+        $suffix = $varbind.Oid.Substring($ColumnOid.Length + 1)
+        if (-not [int]::TryParse($suffix, [System.Globalization.NumberStyles]::None, [cultureinfo]::InvariantCulture, [ref]$index) -or $index -lt 1) {
+            continue
+        }
+        $value = Get-SnmpTypedValue -Varbind $varbind -Type $Type -Minimum $Minimum -Maximum $Maximum
+        if ($null -ne $value) {
+            $map[$index] = $value
         }
     }
     return $map
@@ -2100,16 +2870,17 @@ function Get-SnmpHostResources {
     $cpuIndexes = @()
     $ram = $null
     try {
-        $cpuIndexes = @((Get-SnmpColumn -Session $Session -ColumnOid $script:IfMib.HrProcessorLoad).Keys | Sort-Object)
-        $storageTypes = Get-SnmpColumn -Session $Session -ColumnOid $script:IfMib.HrStorageType
+        $loads = Get-SnmpColumn -Session $Session -ColumnOid $script:IfMib.HrProcessorLoad -Type Integer -Minimum 0 -Maximum 100 -Name 'hrProcessorLoad'
+        $cpuIndexes = @($loads.Keys | Sort-Object)
+        $storageTypes = Get-SnmpColumn -Session $Session -ColumnOid $script:IfMib.HrStorageType -Type ObjectIdentifier -Name 'hrStorageType'
         $ramIndex = @($storageTypes.Keys | Where-Object { $storageTypes[$_] -eq $script:IfMib.HrStorageRam } | Sort-Object | Select-Object -First 1)
         if ($ramIndex.Count -gt 0) {
             $i = $ramIndex[0]
             $values = Invoke-SnmpGet -Session $Session -Oid @("$($script:IfMib.HrStorageUnits).$i", "$($script:IfMib.HrStorageSize).$i")
-            $units = Get-SnmpNumericValue $values["$($script:IfMib.HrStorageUnits).$i"]
-            $size = Get-SnmpNumericValue $values["$($script:IfMib.HrStorageSize).$i"]
-            if ($units -gt 0 -and $size -gt 0) {
-                $ram = [PSCustomObject]@{ Index = $i; Units = [double]$units; TotalBytes = [double]$units * [double]$size }
+            $units = Get-SnmpTypedValue $values["$($script:IfMib.HrStorageUnits).$i"] -Type Integer -Minimum 1
+            $size = Get-SnmpTypedValue $values["$($script:IfMib.HrStorageSize).$i"] -Type Integer -Minimum 1
+            if ($null -ne $units -and $null -ne $size) {
+                $ram = [PSCustomObject]@{ Index = $i; Units = [double]$units; Size = [double]$size; TotalBytes = [double]$units * [double]$size }
             }
         }
     }
@@ -2131,21 +2902,25 @@ function Get-SnmpInterfaceInventory {
 
     $system = Invoke-SnmpGet -Session $Session -Oid @($script:IfMib.SysDescr, $script:IfMib.SysUpTime, $script:IfMib.SysName, $script:IfMib.SysLocation)
 
-    $descr = Get-SnmpColumn -Session $Session -ColumnOid $script:IfMib.IfDescr
-    $type = Get-SnmpColumn -Session $Session -ColumnOid $script:IfMib.IfType
-    $speed = Get-SnmpColumn -Session $Session -ColumnOid $script:IfMib.IfSpeed
-    $admin = Get-SnmpColumn -Session $Session -ColumnOid $script:IfMib.IfAdmin
-    $oper = Get-SnmpColumn -Session $Session -ColumnOid $script:IfMib.IfOper
-    $name = Get-SnmpColumn -Session $Session -ColumnOid $script:IfMib.IfName
-    $alias = Get-SnmpColumn -Session $Session -ColumnOid $script:IfMib.IfAlias
-    $highSpeed = Get-SnmpColumn -Session $Session -ColumnOid $script:IfMib.IfHighSpeed
+    $column = {
+        param ([string]$Name, [string[]]$Type, $Minimum = $null, $Maximum = $null)
+        Get-SnmpColumn -Session $Session -ColumnOid $script:IfMib[$Name] -Type $Type -Minimum $Minimum -Maximum $Maximum -Name $Name
+    }
+    $descr = & $column IfDescr OctetString
+    $type = & $column IfType Integer 1
+    $speed = & $column IfSpeed Gauge32
+    $admin = & $column IfAdmin Integer 1 3
+    $oper = & $column IfOper Integer 1 7
+    $name = & $column IfName OctetString
+    $alias = & $column IfAlias OctetString
+    $highSpeed = & $column IfHighSpeed Gauge32
 
     # Counter64 needs v2c or v3; prefer the 64-bit counters wherever the agent has them.
-    $hcIn = if ($Session.Version -ne 0) { Get-SnmpColumn -Session $Session -ColumnOid $script:IfMib.HCInOctets } else { @{} }
+    $hcIn = if ($Session.Version -ne 0) { & $column HCInOctets Counter64 } else { @{} }
     $in32 = @{}
     $allIndexes = @($descr.Keys) + @($name.Keys) | Sort-Object -Unique
     if (@($allIndexes | Where-Object { -not $hcIn.ContainsKey($_) }).Count -gt 0) {
-        $in32 = Get-SnmpColumn -Session $Session -ColumnOid $script:IfMib.InOctets
+        $in32 = & $column InOctets Counter32
     }
 
     $interfaces = foreach ($index in $allIndexes) {
@@ -2180,25 +2955,18 @@ function Get-SnmpInterfaceInventory {
     }
 
     [PSCustomObject]@{
-        SysName       = ConvertTo-SnmpDisplayString $system[$script:IfMib.SysName].Value
-        SysDescr      = ConvertTo-SnmpDisplayString $system[$script:IfMib.SysDescr].Value
-        SysLocation   = ConvertTo-SnmpDisplayString $system[$script:IfMib.SysLocation].Value
-        SysUpTime     = $system[$script:IfMib.SysUpTime].Value
+        SysName       = ConvertTo-SnmpDisplayString (Get-SnmpTypedValue $system[$script:IfMib.SysName] -Type OctetString)
+        SysDescr      = ConvertTo-SnmpDisplayString (Get-SnmpTypedValue $system[$script:IfMib.SysDescr] -Type OctetString)
+        SysLocation   = ConvertTo-SnmpDisplayString (Get-SnmpTypedValue $system[$script:IfMib.SysLocation] -Type OctetString)
+        SysUpTime     = Get-SnmpTypedValue $system[$script:IfMib.SysUpTime] -Type TimeTicks
         HostResources = if ($IncludeHostResources) { Get-SnmpHostResources -Session $Session } else { $null }
         Interfaces    = @($interfaces)
     }
 }
 
-function Get-SnmpNumericValue {
-    param ($Varbind)
-
-    if ($null -eq $Varbind -or $Varbind.Type -notin 'Counter32', 'Counter64', 'Gauge32', 'TimeTicks', 'Integer') {
-        return $null
-    }
-    return $Varbind.Value
-}
-
 function Get-SnmpInterfaceSample {
+    # One poll of the per-interface counters (plus sysUpTime and, when known, CPU and memory).
+    # Every value is read with the SMI type and range its MIB defines; anything else is $null.
     param ([hashtable]$Session, [object[]]$Interfaces, $HostResources)
 
     $oids = [System.Collections.Generic.List[string]]::new()
@@ -2233,16 +3001,21 @@ function Get-SnmpInterfaceSample {
     $counters = @{}
     foreach ($interface in $Interfaces) {
         $i = $interface.Index
-        $inOid = if ($interface.HighCapacity) { "$($script:IfMib.HCInOctets).$i" } else { "$($script:IfMib.InOctets).$i" }
-        $outOid = if ($interface.HighCapacity) { "$($script:IfMib.HCOutOctets).$i" } else { "$($script:IfMib.OutOctets).$i" }
+        if ($interface.HighCapacity) {
+            $inValue = Get-SnmpTypedValue $values["$($script:IfMib.HCInOctets).$i"] -Type Counter64
+            $outValue = Get-SnmpTypedValue $values["$($script:IfMib.HCOutOctets).$i"] -Type Counter64
+        } else {
+            $inValue = Get-SnmpTypedValue $values["$($script:IfMib.InOctets).$i"] -Type Counter32
+            $outValue = Get-SnmpTypedValue $values["$($script:IfMib.OutOctets).$i"] -Type Counter32
+        }
         $counters[$i] = [PSCustomObject]@{
-            InOctets    = Get-SnmpNumericValue $values[$inOid]
-            OutOctets   = Get-SnmpNumericValue $values[$outOid]
-            InErrors    = Get-SnmpNumericValue $values["$($script:IfMib.InErrors).$i"]
-            OutErrors   = Get-SnmpNumericValue $values["$($script:IfMib.OutErrors).$i"]
-            InDiscards  = Get-SnmpNumericValue $values["$($script:IfMib.InDiscards).$i"]
-            OutDiscards = Get-SnmpNumericValue $values["$($script:IfMib.OutDiscards).$i"]
-            OperStatus  = Get-SnmpNumericValue $values["$($script:IfMib.IfOper).$i"]
+            InOctets    = $inValue
+            OutOctets   = $outValue
+            InErrors    = Get-SnmpTypedValue $values["$($script:IfMib.InErrors).$i"] -Type Counter32
+            OutErrors   = Get-SnmpTypedValue $values["$($script:IfMib.OutErrors).$i"] -Type Counter32
+            InDiscards  = Get-SnmpTypedValue $values["$($script:IfMib.InDiscards).$i"] -Type Counter32
+            OutDiscards = Get-SnmpTypedValue $values["$($script:IfMib.OutDiscards).$i"] -Type Counter32
+            OperStatus  = Get-SnmpTypedValue $values["$($script:IfMib.IfOper).$i"] -Type Integer -Minimum 1 -Maximum 7
         }
     }
 
@@ -2250,18 +3023,18 @@ function Get-SnmpInterfaceSample {
     $memUsedBytes = $null
     if ($null -ne $HostResources) {
         $cpuLoads = @(foreach ($cpu in $HostResources.CpuIndexes) {
-            $load = Get-SnmpNumericValue $values["$($script:IfMib.HrProcessorLoad).$cpu"]
+            $load = Get-SnmpTypedValue $values["$($script:IfMib.HrProcessorLoad).$cpu"] -Type Integer -Minimum 0 -Maximum 100
             if ($null -ne $load) { [double]$load }
         })
         if ($HostResources.Ram) {
-            $used = Get-SnmpNumericValue $values["$($script:IfMib.HrStorageUsed).$($HostResources.Ram.Index)"]
+            $used = Get-SnmpTypedValue $values["$($script:IfMib.HrStorageUsed).$($HostResources.Ram.Index)"] -Type Integer -Minimum 0 -Maximum $HostResources.Ram.Size
             if ($null -ne $used) { $memUsedBytes = [double]$used * $HostResources.Ram.Units }
         }
     }
 
     [PSCustomObject]@{
         Time         = $time
-        UpTime       = Get-SnmpNumericValue $values[$script:IfMib.SysUpTime]
+        UpTime       = Get-SnmpTypedValue $values[$script:IfMib.SysUpTime] -Type TimeTicks
         CpuLoads     = $cpuLoads
         MemUsedBytes = $memUsedBytes
         Counters     = $counters
@@ -2344,7 +3117,8 @@ function Format-SnmpSpeed {
 function Format-SnmpUpTime {
     param ($TimeTicks)
 
-    if ($null -eq $TimeTicks) {
+    # TimeTicks is an unsigned 32-bit count of hundredths of a second.
+    if ($null -eq $TimeTicks -or -not (Test-BandwidthNumber $TimeTicks 0 ([double][uint32]::MaxValue))) {
         return '?'
     }
     $span = [TimeSpan]::FromSeconds([double]$TimeTicks / 100)
@@ -2756,19 +3530,11 @@ function New-BandwidthMonitorRow {
 function Update-BandwidthMonitorState {
     param ([hashtable]$State, $Sample)
 
+    # Validate the whole sample before changing anything, so a bad value cannot leave some rows
+    # updated, others stale, and a fresh success time on screen.
+    Assert-BandwidthSample -State $State -Sample $Sample
+
     $previous = $State.LastSample
-    $State.LastSample = $Sample
-    $State.Now = $Sample.Time
-    $State.LastSuccess = $Sample.Time
-    if ($null -ne $Sample.UpTime) {
-        $State.UpTime = $Sample.UpTime
-    }
-    if ($null -ne $Sample.CpuLoads) {
-        $State.CpuLoads = $Sample.CpuLoads
-    }
-    if ($null -ne $Sample.MemUsedBytes) {
-        $State.MemUsedBytes = $Sample.MemUsedBytes
-    }
     if ($null -eq $State.Events) {
         $State.Events = [System.Collections.Generic.List[object]]::new()
     }
@@ -2825,7 +3591,72 @@ function Update-BandwidthMonitorState {
             }
         }
     }
+
+    $State.LastSample = $Sample
+    $State.Now = $Sample.Time
+    if ($null -ne $Sample.UpTime) {
+        $State.UpTime = $Sample.UpTime
+    }
+    if ($null -ne $Sample.CpuLoads) {
+        $State.CpuLoads = $Sample.CpuLoads
+    }
+    if ($null -ne $Sample.MemUsedBytes) {
+        $State.MemUsedBytes = $Sample.MemUsedBytes
+    }
+    $State.LastSuccess = $Sample.Time
     $State.PollCount++
+}
+
+function Test-BandwidthNumber {
+    # True for $null (unavailable) or a finite number of a numeric .NET type within the range.
+    param ($Value, [double]$Minimum, [double]$Maximum, [switch]$Integral)
+
+    if ($null -eq $Value) {
+        return $true
+    }
+    if ($Value.GetType() -notin [byte], [sbyte], [int16], [uint16], [int], [uint32], [long], [uint64], [single], [double], [decimal]) {
+        return $false
+    }
+    $number = [double]$Value
+    if ([double]::IsNaN($number) -or [double]::IsInfinity($number) -or $number -lt $Minimum -or $number -gt $Maximum) {
+        return $false
+    }
+    return -not $Integral -or $number -eq [Math]::Floor($number)
+}
+
+function Assert-BandwidthSample {
+    # Throws if any value in a sample has the wrong type or is out of range for its MIB object.
+    param ([hashtable]$State, $Sample)
+
+    $counterMax = [double][uint64]::MaxValue
+    if ($null -eq $Sample.Time -or -not (Test-BandwidthNumber $Sample.Time 0 ([double]::MaxValue))) {
+        throw 'Rejected SNMP sample: invalid sample time.'
+    }
+    if (-not (Test-BandwidthNumber $Sample.UpTime 0 ([double][uint32]::MaxValue) -Integral)) {
+        throw 'Rejected SNMP sample: invalid sysUpTime.'
+    }
+    foreach ($load in @($Sample.CpuLoads)) {
+        if ($null -ne $load -and -not (Test-BandwidthNumber $load 0 100)) {
+            throw 'Rejected SNMP sample: invalid CPU load.'
+        }
+    }
+    if (-not (Test-BandwidthNumber $Sample.MemUsedBytes 0 ([double]::MaxValue))) {
+        throw 'Rejected SNMP sample: invalid memory usage.'
+    }
+    foreach ($row in $State.Rows) {
+        $current = $Sample.Counters[$row.Index]
+        if ($null -eq $current) {
+            continue
+        }
+        if (-not (Test-BandwidthNumber $current.OperStatus 1 7 -Integral)) {
+            throw "Rejected SNMP sample: invalid ifOperStatus for interface $($row.Index)."
+        }
+        foreach ($field in @('InOctets', 'OutOctets') + $script:BandwidthErrorFields) {
+            if (-not (Test-BandwidthNumber $current.$field 0 $counterMax -Integral)) {
+                throw "Rejected SNMP sample: invalid $field for interface $($row.Index)."
+            }
+        }
+    }
 }
 
 function Get-BandwidthErrorValue {
@@ -3310,7 +4141,9 @@ function Get-BandwidthMonitorHeader {
             # Per-core sparkline so one pegged core is visible behind a calm average.
             $suffix = @(New-BandwidthPart ' ')
             foreach ($load in $loads) {
-                $level = [Math]::Min(7, [int][Math]::Floor([Math]::Max(0, $load) / 12.5))
+                # Bound the reading before converting it, so a bad value cannot overflow the cast.
+                $level = [int][Math]::Floor([Math]::Min(100.0, [Math]::Max(0.0, [double]$load)) / 12.5)
+                $level = [Math]::Min(7, $level)
                 $suffix += New-BandwidthPart ([string][char](0x2581 + $level)) (Get-BandwidthLoadCode $load)
             }
         }

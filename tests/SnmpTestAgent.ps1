@@ -83,6 +83,11 @@ function Start-SnmpTestAgent {
         [switch]$HideEngineTime,
         # Answer Get requests carrying more varbinds than this with tooBig (0 = unlimited).
         [int]$MaxResponseVarbinds = 0,
+        # Upper bounds for one GetBulk reply, whatever max-repetitions the request asks for.
+        [ValidateRange(1, 10000)]
+        [int]$MaxBulkVarbinds = 64,
+        [ValidateRange(64, 65000)]
+        [int]$MaxBulkBytes = 4096,
         [int]$Port = 0
     )
 
@@ -92,6 +97,8 @@ function Start-SnmpTestAgent {
         V3User              = $V3User
         HideEngineTime      = [bool]$HideEngineTime
         MaxResponseVarbinds = $MaxResponseVarbinds
+        MaxBulkVarbinds     = $MaxBulkVarbinds
+        MaxBulkBytes        = $MaxBulkBytes
     }
 
     $agentScript = {
@@ -167,23 +174,35 @@ function Start-SnmpTestAgent {
                         }
                     }
                 } elseif ($pdu.PduType -eq 0xA5) {
-                    $nonRepeaters = [Math]::Min($pdu.ErrorStatus, $requested.Count)
+                    # Bounded GetBulk: at most MaxBulkVarbinds bindings and MaxBulkBytes encoded,
+                    # and generation stops once every repeater has reached the end of the MIB, so
+                    # a request's max-repetitions cannot make the agent build a huge reply.
+                    $limit = [Math]::Max(1, $Options.MaxBulkVarbinds)
+                    $nonRepeaters = [Math]::Min([Math]::Max(0, $pdu.ErrorStatus), $requested.Count)
                     $repetitions = [Math]::Max(1, $pdu.ErrorIndex)
-                    for ($i = 0; $i -lt $nonRepeaters; $i++) {
+                    for ($i = 0; $i -lt $nonRepeaters -and $out.Count -lt $limit; $i++) {
                         $next = & $nextOid $requested[$i].Oid
                         $out.Add($(if ($next) { & $readValue $next } else { [PSCustomObject]@{ Oid = $requested[$i].Oid; Type = 'EndOfMibView'; Value = $null } }))
                     }
                     $cursors = @($requested | Select-Object -Skip $nonRepeaters | ForEach-Object { $_.Oid })
-                    for ($r = 0; $r -lt $repetitions -and $cursors.Count -gt 0; $r++) {
-                        for ($c = 0; $c -lt $cursors.Count; $c++) {
-                            $next = if ($cursors[$c]) { & $nextOid $cursors[$c] } else { $null }
+                    $ended = [bool[]]::new($cursors.Count)
+                    for ($r = 0; $r -lt $repetitions -and $cursors.Count -gt 0 -and $out.Count -lt $limit; $r++) {
+                        if ($ended -notcontains $false) {
+                            break
+                        }
+                        for ($c = 0; $c -lt $cursors.Count -and $out.Count -lt $limit; $c++) {
+                            $next = if ($ended[$c]) { $null } else { & $nextOid $cursors[$c] }
                             if ($next) {
                                 $out.Add((& $readValue $next))
+                                $cursors[$c] = $next
                             } else {
-                                $out.Add([PSCustomObject]@{ Oid = ($cursors[$c] ?? '0.0'); Type = 'EndOfMibView'; Value = $null })
+                                $out.Add([PSCustomObject]@{ Oid = $cursors[$c]; Type = 'EndOfMibView'; Value = $null })
+                                $ended[$c] = $true
                             }
-                            $cursors[$c] = $next
                         }
+                    }
+                    while ($out.Count -gt 1 -and (ConvertTo-SnmpVarbindListTlv -Varbinds @($out)).Length -gt $Options.MaxBulkBytes) {
+                        $out.RemoveRange([Math]::Max(1, [int]($out.Count * 0.8)), $out.Count - [Math]::Max(1, [int]($out.Count * 0.8)))
                     }
                 }
 
@@ -207,7 +226,10 @@ function Start-SnmpTestAgent {
                     }
                 }
                 $agentSession = New-SnmpSession @sessionParams
-                Close-SnmpSession $agentSession
+                # The agent only needs the session's keys, not its client socket. Close-SnmpSession
+                # would also wipe the keys, so it runs when the agent stops (below).
+                $agentSession.Socket.Dispose()
+                $agentSession.Socket = $null
                 $engineId = [byte[]](@(0x80, 0x00, 0x1F, 0x88, 0x04) + [System.Text.Encoding]::ASCII.GetBytes('nt-test'))
                 Set-SnmpV3Engine -Session $agentSession -EngineId $engineId -Boots 7 -Time 4242
             }
@@ -295,6 +317,9 @@ function Start-SnmpTestAgent {
                 catch {
                     # Ignore anything the agent cannot parse or answer, like a real agent would.
                 }
+            }
+            if ($null -ne $agentSession) {
+                Close-SnmpSession $agentSession
             }
         } $Udp $Mib $Options
     }
