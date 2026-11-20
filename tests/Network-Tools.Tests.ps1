@@ -994,6 +994,214 @@ Describe 'SNMP security diagnostic reports' {
     }
 }
 
+Describe 'SNMP security delayed Reports' {
+    $credentials = @{ UserName = 'monitor'; AuthPassword = 'authpass123'; PrivPassword = 'privpass123' }
+    $agent = Start-SnmpTestAgent -ModulePath $modulePath -Mib (New-SnmpTestMib) -V3User $credentials -HideEngineTime -ReportDelayMs 450
+    try {
+        It 'accepts a discovery reply after a later attempt has been sent' {
+            & (Get-Module Network-Tools) {
+                param ($Port, $Credentials, $ExpectedEngine)
+                $session = New-SnmpSession 127.0.0.1 -Port $Port @Credentials -TimeoutMs 300 -Retries 4
+                try {
+                    $nextId = $session.NextId
+                    Initialize-SnmpV3Engine -Session $session
+                    (Test-SnmpBytesEqual $session.EngineId $ExpectedEngine) | Should Be $true
+                    ($session.NextId - $nextId) | Should BeGreaterThan 1
+                }
+                finally {
+                    Close-SnmpSession $session
+                }
+            } $agent.Port $credentials $agent.Engine.Id
+        }
+
+        It 'resynchronizes from an authenticated time Report for an earlier attempt' {
+            & (Get-Module Network-Tools) {
+                param ($Port, $Credentials)
+                $session = New-SnmpSession 127.0.0.1 -Port $Port @Credentials -TimeoutMs 2000 -Retries 6
+                try {
+                    Initialize-SnmpV3Engine -Session $session
+                    $session.TimeoutMs = 300
+                    $oid = $script:IfMib.SysName
+                    $values = Invoke-SnmpGet -Session $session -Oid $oid
+                    (ConvertTo-SnmpDisplayString $values[$oid].Value) | Should Be 'test-agent'
+                    $session.TimeTrusted | Should Be $true
+                }
+                finally {
+                    Close-SnmpSession $session
+                }
+            } $agent.Port $credentials
+        }
+    }
+    finally {
+        Stop-SnmpTestAgent $agent
+    }
+
+    It 'reports a stale authenticated clock without retrying' {
+        $agent = Start-SnmpTestAgent -ModulePath $modulePath -Mib (New-SnmpTestMib) -V3User $credentials
+        try {
+            & (Get-Module Network-Tools) {
+                param ($Port, $Credentials)
+                $session = New-SnmpSession 127.0.0.1 -Port $Port @Credentials -TimeoutMs 700 -Retries 3
+                try {
+                    $oid = $script:IfMib.SysName
+                    $null = Invoke-SnmpGet -Session $session -Oid $oid
+                    $session.EngineTime += 220
+                    $session.LatestReceivedEngineTime += 220
+                    $nextId = $session.NextId
+                    $watch = [System.Diagnostics.Stopwatch]::StartNew()
+                    { Invoke-SnmpGet -Session $session -Oid $oid } | Should Throw 'Check the agent clock and engineBoots'
+                    ($session.NextId - $nextId) | Should Be 2
+                    $watch.ElapsedMilliseconds | Should BeLessThan 1400
+                }
+                finally {
+                    Close-SnmpSession $session
+                }
+            } $agent.Port $credentials
+        }
+        finally {
+            Stop-SnmpTestAgent $agent
+        }
+    }
+}
+
+Describe 'SNMP security engine transitions' {
+    It 'handles a genuine engine change while the client is <State>' -TestCases @(
+        @{ State = 'unconfirmed'; Confirmed = $false }
+        @{ State = 'confirmed'; Confirmed = $true }
+    ) {
+        param ($Confirmed)
+        $credentials = @{ UserName = 'monitor'; AuthPassword = 'authpass123'; PrivPassword = 'privpass123' }
+        $agent = Start-SnmpTestAgent -ModulePath $modulePath -Mib (New-SnmpTestMib) -V3User $credentials
+        try {
+            & (Get-Module Network-Tools) {
+                param ($Agent, $Credentials, $Confirmed)
+                $session = New-SnmpSession 127.0.0.1 -Port $Agent.Port @Credentials -TimeoutMs 500 -Retries 0
+                try {
+                    $oid = $script:IfMib.SysName
+                    Initialize-SnmpV3Engine -Session $session
+                    if ($Confirmed) {
+                        $null = Invoke-SnmpGet -Session $session -Oid $oid
+                    }
+                    $session.TimeTrusted | Should Be $Confirmed
+                    $initialEngine = $session.EngineId
+                    $initialAuth = $session.AuthKey
+                    $initialPriv = $session.PrivKey
+                    $lastSync = $session.EngineTimeSyncedAt
+                    $Agent.Engine.Id = [byte[]](128, 0, 31, 136, 4, 12, 3)
+
+                    if ($Confirmed) {
+                        { Invoke-SnmpGet -Session $session -Oid $oid } | Should Throw 'Start a new session'
+                        $Agent.Engine.Discoveries | Should Be 1
+                        (Test-SnmpBytesEqual $session.EngineId $initialEngine) | Should Be $true
+                        [object]::ReferenceEquals($initialAuth, $session.AuthKey) | Should Be $true
+                        [object]::ReferenceEquals($initialPriv, $session.PrivKey) | Should Be $true
+                        $session.EngineTimeSyncedAt | Should Be $lastSync
+                    } else {
+                        $values = Invoke-SnmpGet -Session $session -Oid $oid
+                        (ConvertTo-SnmpDisplayString $values[$oid].Value) | Should Be 'test-agent'
+                        $session.TimeTrusted | Should Be $true
+                        (Test-SnmpBytesEqual $session.EngineId $Agent.Engine.Id) | Should Be $true
+                        $Agent.Engine.Discoveries | Should Be 2
+                        @($initialAuth | Where-Object { $_ -ne 0 }).Count | Should Be 0
+                        @($initialPriv | Where-Object { $_ -ne 0 }).Count | Should Be 0
+                    }
+                }
+                finally {
+                    Close-SnmpSession $session
+                }
+            } $agent $credentials $Confirmed
+        }
+        finally {
+            Stop-SnmpTestAgent $agent
+        }
+    }
+
+    It 'advises opening a new session when authentication never confirms discovery' {
+        $credentials = @{ UserName = 'monitor'; AuthPassword = 'authpass123' }
+        $agent = Start-SnmpTestAgent -ModulePath $modulePath -Mib (New-SnmpTestMib) -V3User $credentials
+        try {
+            { Get-SnmpInterface 127.0.0.1 -Port $agent.Port -UserName unknown -AuthPassword 'authpass123' -TimeoutMs 500 -Retries 0 } |
+                Should Throw 'Start a new session'
+        }
+        finally {
+            Stop-SnmpTestAgent $agent
+        }
+    }
+
+    It 'preserves provisional state and clears candidate keys when rediscovery cannot authenticate' {
+        $credentials = @{ UserName = 'monitor'; AuthPassword = 'authpass123'; PrivPassword = 'privpass123' }
+        $agent = Start-SnmpTestAgent -ModulePath $modulePath -Mib (New-SnmpTestMib) -V3User $credentials
+        Mock Test-SnmpV3Mac -ModuleName Network-Tools -ParameterFilter { $null -ne $Session.TestCandidateKeys } {
+            param ($Session)
+            $Session.TestCandidateKeys.Auth = $Session.AuthKey
+            $Session.TestCandidateKeys.Priv = $Session.PrivKey
+            return $false
+        }
+        try {
+            & (Get-Module Network-Tools) {
+                param ($Agent, $Credentials)
+                $session = New-SnmpSession 127.0.0.1 -Port $Agent.Port @Credentials -TimeoutMs 500 -Retries 0
+                try {
+                    Initialize-SnmpV3Engine -Session $session
+                    $initialEngine = $session.EngineId
+                    $initialAuth = $session.AuthKey
+                    $initialPriv = $session.PrivKey
+                    $lastSync = $session.EngineTimeSyncedAt
+                    $session.TestCandidateKeys = @{}
+                    $Agent.Engine.Id = [byte[]](128, 0, 31, 136, 4, 12, 4)
+                    { Invoke-SnmpGet -Session $session -Oid $script:IfMib.SysName } | Should Throw 'Start a new session'
+
+                    $Agent.Engine.Discoveries | Should Be 2
+                    $session.TimeTrusted | Should Be $false
+                    (Test-SnmpBytesEqual $session.EngineId $initialEngine) | Should Be $true
+                    [object]::ReferenceEquals($initialAuth, $session.AuthKey) | Should Be $true
+                    [object]::ReferenceEquals($initialPriv, $session.PrivKey) | Should Be $true
+                    $session.EngineTimeSyncedAt | Should Be $lastSync
+                    foreach ($buffer in $session.TestCandidateKeys.Auth, $session.TestCandidateKeys.Priv) {
+                        $buffer.Length | Should BeGreaterThan 0
+                        @($buffer | Where-Object { $_ -ne 0 }).Count | Should Be 0
+                    }
+                    { Invoke-SnmpGet -Session $session -Oid $script:IfMib.SysName } | Should Throw 'Start a new session'
+                    $Agent.Engine.Discoveries | Should Be 2
+                }
+                finally {
+                    Close-SnmpSession $session
+                }
+            } $agent $credentials
+        }
+        finally {
+            Stop-SnmpTestAgent $agent
+        }
+    }
+
+    It 'includes restart advice when rediscovery authenticates but the request times out' {
+        $credentials = @{ UserName = 'monitor'; AuthPassword = 'authpass123'; PrivPassword = 'privpass123' }
+        $agent = Start-SnmpTestAgent -ModulePath $modulePath -Mib (New-SnmpTestMib) -V3User $credentials -HideEngineTime -ResponseDelayMs 1100
+        try {
+            & (Get-Module Network-Tools) {
+                param ($Agent, $Credentials)
+                $session = New-SnmpSession 127.0.0.1 -Port $Agent.Port @Credentials -TimeoutMs 500 -Retries 0
+                try {
+                    Initialize-SnmpV3Engine -Session $session
+                    $initialEngine = $session.EngineId
+                    $nextId = $session.NextId
+                    $Agent.Engine.Id = [byte[]](128, 0, 31, 136, 4, 12, 5)
+                    { Invoke-SnmpGet -Session $session -Oid $script:IfMib.SysName } | Should Throw 'Start a new session'
+                    ($session.NextId - $nextId) | Should Be 6
+                    $session.TimeTrusted | Should Be $false
+                    (Test-SnmpBytesEqual $session.EngineId $initialEngine) | Should Be $true
+                }
+                finally {
+                    Close-SnmpSession $session
+                }
+            } $agent $credentials
+        }
+        finally {
+            Stop-SnmpTestAgent $agent
+        }
+    }
+}
+
 Describe 'SNMP security credential validation' {
     InModuleScope Network-Tools {
         $invalidOptions = @(
@@ -1394,11 +1602,11 @@ Describe 'SNMP security v3 response policy' {
         }
         function New-PolicyReply {
             # A message from $Session (acting as the agent) answering msgID 900 / request-id 500.
-            param ($Session, [int]$RequestId = 500, [string]$Level, [int]$PduType = 0xA2, [string]$Oid = '1.3.6.1.2.1.1.5.0', [string]$User)
+            param ($Session, [int]$RequestId = 500, [string]$Level, [int]$PduType = 0xA2, [string]$Oid = '1.3.6.1.2.1.1.5.0', [string]$User, [int]$MsgId = 900)
             $type = if ($PduType -eq 0xA8) { 'Counter32' } else { 'OctetString' }
             $value = if ($PduType -eq 0xA8) { 1 } else { 'sw1' }
             $pdu = ConvertTo-SnmpPduBytes -PduType $PduType -RequestId $RequestId -Varbinds @([PSCustomObject]@{ Oid = $Oid; Type = $type; Value = $value })
-            $parameters = @{ Session = $Session; MsgId = 900; Pdu = $pdu; Reportable = $false }
+            $parameters = @{ Session = $Session; MsgId = $MsgId; Pdu = $pdu; Reportable = $false }
             if ($Level) { $parameters.SecurityLevel = $Level }
             if ($PSBoundParameters.ContainsKey('User')) { $parameters.UserName = $User }
             ConvertTo-SnmpV3Message @parameters
@@ -1565,6 +1773,42 @@ Describe 'SNMP security v3 response policy' {
                 $reply.Action | Should Be 'Resend'
                 $client.EngineBoots | Should Be 9
                 $client.TimeTrusted | Should Be $true
+            }
+            finally {
+                Close-SnmpSession $client
+                Close-SnmpSession $agent
+            }
+        }
+
+        It 'resends each pending request only until it has used the corrected clock' {
+            $client = New-PolicySession
+            $agent = New-PolicySession
+            try {
+                Update-SnmpV3Clock -Session $client -Boots 7 -Time 1000
+                $originalClock = $client.ClockVersion
+                $first = @{ Key = 900; RequestId = 500; Request = $request; AttemptClocks = @{ 900 = $originalClock } }
+                $second = @{ Key = 901; RequestId = 501; Request = $request; AttemptClocks = @{ 901 = $originalClock } }
+                $other = @{ Key = 902; RequestId = 502; Request = $request; AttemptClocks = @{ 902 = $originalClock } }
+                $pending = @{ 900 = $first; 901 = $second; 902 = $other }
+                $timeReport = @{ Session = $agent; PduType = 0xA8; Oid = '1.3.6.1.6.3.15.1.1.2.0'; Level = 'AuthNoPriv' }
+
+                $agent.EngineTime = 1010
+                $reply = Read-SnmpExchangeReply -Session $client -Data (New-PolicyReply $agent -MsgId 902 -RequestId 502) -Pending $pending
+                $reply.Action | Should Be 'Complete'
+                $client.ClockVersion | Should Be $originalClock
+                $reply = Read-SnmpExchangeReply -Session $client -Data (New-PolicyReply @timeReport -MsgId 900 -RequestId 500) -Pending $pending
+                $reply.Action | Should Be 'Resend'
+                $correctedClock = $client.ClockVersion
+                $correctedClock | Should BeGreaterThan $originalClock
+
+                $first.Key = 903
+                $first.AttemptClocks[903] = $correctedClock
+                $agent.EngineTime += 2
+                Read-SnmpExchangeReply -Session $client -Data (New-PolicyReply @timeReport -MsgId 900 -RequestId 500) -Pending $pending |
+                    Should BeNullOrEmpty
+                $reply = Read-SnmpExchangeReply -Session $client -Data (New-PolicyReply @timeReport -MsgId 901 -RequestId 501) -Pending $pending
+                $reply.Action | Should Be 'Resend'
+                $client.ClockVersion | Should Be $correctedClock
             }
             finally {
                 Close-SnmpSession $client
@@ -1857,7 +2101,29 @@ Describe 'SNMP security display text controls' {
             $symbol = [char]::ConvertFromUtf32(0x1F4E1)
             $tag = [char]::ConvertFromUtf32(0xE0020)
             $inputLabel = "A$([char]0x200B)B$tag$symbol$([char]0xD800)C"
-            ConvertTo-SnmpDisplayString $inputLabel | Should Be "A B $symbol C"
+            ConvertTo-SnmpDisplayString $inputLabel | Should Be "AB$symbol C"
+        }
+    }
+}
+
+Describe 'SNMP display label normalization' {
+    It 'removes invisible formatting marks without inserting spaces into labels' {
+        & (Get-Module Network-Tools) {
+            foreach ($codePoint in 0x200B, 0x034F, 0x115F, 0x1160, 0x3164, 0xFFA0, 0xFE00, 0xFE0F, 0xE0100, 0xE01EF) {
+                $mark = [char]::ConvertFromUtf32($codePoint)
+                ConvertTo-SnmpDisplayString "label$($mark)1" | Should Be (ConvertTo-SnmpDisplayString 'label1')
+            }
+            $letter = [char]0x0645
+            ConvertTo-SnmpDisplayString "$letter$([char]0x200C)$letter" | Should Be "$letter$letter"
+            $symbol = [char]::ConvertFromUtf32(0x1F4E1)
+            ConvertTo-SnmpDisplayString "$symbol$([char]0x200D)$symbol" | Should Be "$symbol$symbol"
+        }
+    }
+
+    It 'normalizes Unicode spaces to ASCII and collapses runs' {
+        & (Get-Module Network-Tools) {
+            ConvertTo-SnmpDisplayString "alpha$([char]0x00A0)$([char]0x2009) beta$([char]0x3000)gamma" |
+                Should Be 'alpha beta gamma'
         }
     }
 }
@@ -1916,31 +2182,67 @@ Describe 'SNMP security loopback agent bulk limit' {
     }
 
     It 'trims a two-binding bulk page and still answers the next request' {
-        $mib = New-SnmpTestMib -InterfaceCount 2
-        $column = '1.3.6.1.2.1.2.2.1.2'
-        $mib["$column.1"].Value = 'a' * 30
-        $mib["$column.2"].Value = 'b' * 30
-        $agent = Start-SnmpTestAgent -ModulePath $modulePath -Mib $mib -MaxBulkBytes 64
+        # A regression can hang inside the agent's cleanup as well as the exchange.
+        $testScript = {
+            $ErrorActionPreference = 'Stop'
+            $module = Import-Module $env:NETWORKTOOLS_TEST_MODULE -PassThru
+            . $env:NETWORKTOOLS_TEST_AGENT
+            $mib = New-SnmpTestMib -InterfaceCount 2
+            $column = '1.3.6.1.2.1.2.2.1.2'
+            $mib["$column.1"].Value = 'a' * 30
+            $mib["$column.2"].Value = 'b' * 30
+            $agent = Start-SnmpTestAgent -ModulePath $env:NETWORKTOOLS_TEST_MODULE -Mib $mib -MaxBulkBytes 64
+            try {
+                & $module {
+                    param ($Port, $Column)
+                    $session = New-SnmpSession -ComputerName 127.0.0.1 -Port $Port -TimeoutMs 1000 -Retries 0
+                    try {
+                        $reply = (Invoke-SnmpExchange -Session $session -Requests @(@{
+                            PduType = $script:SnmpPduTypes.GetBulk; Oids = @($Column); NonRepeaters = 0; MaxRepetitions = 2
+                        }))[0]
+                        if ($reply.Varbinds.Count -ne 1 -or $reply.Varbinds[0].Oid -ne "$Column.1") {
+                            throw 'The trimmed bulk page did not return its first binding.'
+                        }
+                        $values = Invoke-SnmpGet -Session $session -Oid $script:IfMib.SysName
+                        if ((ConvertTo-SnmpDisplayString $values[$script:IfMib.SysName].Value) -ne 'test-agent') {
+                            throw 'The fixture did not answer the next request.'
+                        }
+                    }
+                    finally {
+                        Close-SnmpSession $session
+                    }
+                } $agent.Port $column
+            }
+            finally {
+                Stop-SnmpTestAgent $agent
+            }
+        }
+        $pwshName = if ($IsWindows) { 'pwsh.exe' } else { 'pwsh' }
+        $start = [System.Diagnostics.ProcessStartInfo]::new((Join-Path $PSHOME $pwshName))
+        $start.UseShellExecute = $false
+        $start.CreateNoWindow = $true
+        $start.RedirectStandardError = $true
+        foreach ($argument in '-NoProfile', '-NonInteractive', '-Command', $testScript.ToString()) {
+            $start.ArgumentList.Add($argument)
+        }
+        $start.Environment['NETWORKTOOLS_TEST_MODULE'] = (Resolve-Path -LiteralPath $modulePath).Path
+        $start.Environment['NETWORKTOOLS_TEST_AGENT'] = (Join-Path $here 'SnmpTestAgent.ps1')
+        $process = [System.Diagnostics.Process]::Start($start)
         try {
-            & (Get-Module Network-Tools) {
-                param ($Port, $Column)
-                $session = New-SnmpSession -ComputerName 127.0.0.1 -Port $Port -TimeoutMs 1000 -Retries 0
-                try {
-                    $reply = (Invoke-SnmpExchange -Session $session -Requests @(@{
-                        PduType = $script:SnmpPduTypes.GetBulk; Oids = @($Column); NonRepeaters = 0; MaxRepetitions = 2
-                    }))[0]
-                    $reply.Varbinds.Count | Should Be 1
-                    $reply.Varbinds[0].Oid | Should Be "$Column.1"
-                    $values = Invoke-SnmpGet -Session $session -Oid $script:IfMib.SysName
-                    (ConvertTo-SnmpDisplayString $values[$script:IfMib.SysName].Value) | Should Be 'test-agent'
-                }
-                finally {
-                    Close-SnmpSession $session
-                }
-            } $agent.Port $column
+            $errorOutput = $process.StandardError.ReadToEndAsync()
+            if (-not $process.WaitForExit(15000)) {
+                throw 'The bulk-response test exceeded its 15-second deadline.'
+            }
+            if ($process.ExitCode -ne 0) {
+                throw "The bulk-response test failed: $($errorOutput.GetAwaiter().GetResult())"
+            }
         }
         finally {
-            Stop-SnmpTestAgent $agent
+            if (-not $process.HasExited) {
+                $process.Kill()
+                [void]$process.WaitForExit(1000)
+            }
+            $process.Dispose()
         }
     }
 }

@@ -163,6 +163,8 @@ Limit the view to some interfaces (by index, name, description, or alias; wildca
 Invoke-BwMon 10.0.0.1 -Community public -Interface 'Te1/1/*', 'Po*' -IntervalSeconds 5
 ```
 
+Interface discovery reads the full IF-MIB table and can time out after 60 seconds on very large or slow devices. The `-Interface` filter applies after discovery.
+
 Scripted counters, for example to find ports that are taking errors:
 
 ```powershell

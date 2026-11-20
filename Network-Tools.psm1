@@ -969,7 +969,7 @@ function ConvertFrom-SnmpBerValue {
 }
 
 function ConvertTo-SnmpDisplayString {
-    # Match surrogate pairs first so supplementary Unicode letters and symbols survive.
+    # Check complete surrogate pairs before replacing unpaired code units.
     param ($Value)
 
     if ($null -eq $Value) {
@@ -978,13 +978,20 @@ function ConvertTo-SnmpDisplayString {
     $text = if ($Value -is [byte[]]) { [System.Text.Encoding]::UTF8.GetString($Value) } else { [string]$Value }
     $replaceControl = [System.Text.RegularExpressions.MatchEvaluator]{
         param ($Match)
-        if ($Match.Length -eq 2 -and
-            [System.Globalization.CharUnicodeInfo]::GetUnicodeCategory($Match.Value, 0) -ne [System.Globalization.UnicodeCategory]::Format) {
+        if ($Match.Groups['invisible'].Success) {
+            return ''
+        }
+        if ($Match.Length -eq 2) {
+            if ([System.Globalization.CharUnicodeInfo]::GetUnicodeCategory($Match.Value, 0) -eq [System.Globalization.UnicodeCategory]::Format) {
+                return ''
+            }
             return $Match.Value
         }
         return ' '
     }
-    $text = [regex]::Replace($text, '[\uD800-\uDBFF][\uDC00-\uDFFF]|[\p{Cc}\p{Cf}\p{Cs}\p{Zl}\p{Zp}]', $replaceControl)
+    $pattern = '(?<invisible>[\p{Cf}\u034F\u115F\u1160\u3164\uFE00-\uFE0F\uFFA0]|\uDB40[\uDC00-\uDC7F\uDD00-\uDDEF])|' +
+        '[\uD800-\uDBFF][\uDC00-\uDFFF]|[\p{Cc}\p{Cs}\p{Zl}\p{Zp}\p{Zs}]'
+    $text = [regex]::Replace($text, $pattern, $replaceControl)
     return ($text -replace ' {2,}', ' ').Trim()
 }
 
@@ -1830,9 +1837,14 @@ function Test-SnmpV3Timeliness {
 
 function Update-SnmpV3Clock {
     # A newer received time can correct a running estimate that has moved too far ahead.
-    param ([hashtable]$Session, [long]$Boots, [long]$Time)
+    param ([hashtable]$Session, [long]$Boots, [long]$Time, [switch]$Resynchronize)
 
-    if (Test-SnmpV3ClockAdvance -Session $Session -Boots $Boots -Time $Time) {
+    $advance = Test-SnmpV3ClockAdvance -Session $Session -Boots $Boots -Time $Time
+    # Ordinary time updates within one authenticated boot do not supersede pending attempts.
+    if ($Resynchronize -or ($advance -and (-not $Session.TimeTrusted -or $Boots -ne $Session.EngineBoots))) {
+        $Session.ClockVersion++
+    }
+    if ($advance) {
         $Session.EngineBoots = $Boots
         $Session.EngineTime = $Time
         $Session.LatestReceivedEngineTime = $Time
@@ -1855,6 +1867,7 @@ function Set-SnmpV3Engine {
     $Session.LatestReceivedEngineTime = $null
     $Session.EngineTimeSyncedAt = $Session.Clock.Elapsed.TotalSeconds
     $Session.TimeTrusted = $false
+    $Session.ClockVersion++
 
     if ($changed) {
         Clear-SnmpBytes $Session.AuthKey
@@ -2071,6 +2084,8 @@ function New-SnmpSession {
             $session.LatestReceivedEngineTime = $null
             $session.EngineTimeSyncedAt = 0.0
             $session.TimeTrusted = $false
+            $session.ClockVersion = 0
+            $session.RediscoveryAttempted = $false
 
             if ($authSecret) {
                 # [string] parameters default to '' rather than $null, so ?? would never apply here.
@@ -2264,21 +2279,22 @@ function Get-SnmpReportMessage {
     return "SNMP agent $target returned report $Report."
 }
 
+$script:SnmpNewSessionAdvice = ' Start a new session to verify the agent engine.'
+
 function Get-SnmpTimeoutMessage {
     param ([hashtable]$Session, [hashtable]$Entry)
 
     $target = "$($Session.ComputerName):$($Session.Endpoint.Port)"
-    if ($Entry.StaleClock) {
-        return "$target sent an authenticated SNMPv3 time-window Report outside the trusted window. Check the agent clock and engineBoots."
+    $advice = ''
+    if ($Session.Version -eq 3 -and $Session.SecurityLevel -ne 'NoAuthNoPriv' -and $null -ne $Session.EngineId -and
+        (-not $Session.TimeTrusted -or $Entry.Hint -eq 'unknownEngineIDs')) {
+        $advice = $script:SnmpNewSessionAdvice
     }
     if ($Entry.Hint) {
         $detail = Get-SnmpReportMessage -Session $Session -Report $Entry.Hint
-        if ($Entry.Hint -eq 'unknownEngineIDs' -and $Session.TimeTrusted) {
-            $detail += ' Start a new session to verify the agent engine.'
-        }
-        return "$detail No authenticated reply from $target after $($Entry.Attempts) attempts; the agent's report was not authenticated."
+        return "$detail No authenticated reply from $target after $($Entry.Attempts) attempts; the agent's report was not authenticated.$advice"
     }
-    return "No SNMP response from $target after $($Entry.Attempts) attempts (check reachability, version, and credentials)."
+    return "No SNMP response from $target after $($Entry.Attempts) attempts (check reachability, version, and credentials).$advice"
 }
 
 function Test-SnmpResponseShape {
@@ -2356,7 +2372,6 @@ function Read-SnmpExchangeReply {
       Resend    - resend the request with a fresh msgID (authenticated time resync, or engine
                   rediscovery on a noAuthNoPriv session)
       Hint      - an unauthenticated Report; kept only to explain a later timeout
-      StaleClock - an authenticated time Report outside the trusted window
       Fail      - Message is an authoritative error
 
     Order of checks: correlate (community or msgID) -> authenticate (engine, user, MAC,
@@ -2387,13 +2402,14 @@ function Read-SnmpExchangeReply {
         return [PSCustomObject]@{ Entry = $entry; Action = 'Complete'; Pdu = $pdu }
     }
 
-    $entry = $Pending[[int]$message.MsgId]
+    $msgId = [int]$message.MsgId
+    $entry = $Pending[$msgId]
     if ($null -eq $entry) {
         return $null
     }
     $auth = ($message.Flags -band 0x01) -ne 0
     $priv = ($message.Flags -band 0x02) -ne 0
-    $currentAttempt = [int]$message.MsgId -eq [int]$entry.Key
+    $currentAttempt = $msgId -eq [int]$entry.Key
     if ($priv -and -not $auth) {
         return $null
     }
@@ -2407,11 +2423,21 @@ function Read-SnmpExchangeReply {
         if (-not (Test-SnmpV3Mac -Session $Session -Data $Data -Message $message)) {
             return $null
         }
+        $attemptClock = $Session.ClockVersion
+        if ($null -ne $entry.AttemptClocks) {
+            $attemptClock = $entry.AttemptClocks[$msgId]
+        }
+        $sameClock = $attemptClock -eq $Session.ClockVersion
         if (-not (Test-SnmpV3Timeliness -Session $Session -Boots $message.EngineBoots -Time $message.EngineTime)) {
             $header = $message.ScopedPdu.Pdu
-            if ($currentAttempt -and -not $priv -and $header.PduType -eq $script:SnmpPduTypes.Report -and
+            if ($sameClock -and -not $priv -and $header.PduType -eq $script:SnmpPduTypes.Report -and
                 (Read-SnmpReportName $header) -eq 'notInTimeWindows') {
-                return [PSCustomObject]@{ Entry = $entry; Action = 'StaleClock' }
+                $target = "$($Session.ComputerName):$($Session.Endpoint.Port)"
+                return [PSCustomObject]@{
+                    Entry = $entry
+                    Action = 'Fail'
+                    Message = "$target sent an authenticated SNMPv3 time-window Report outside the trusted window. Check the agent clock and engineBoots."
+                }
             }
             Write-Verbose 'Ignoring an authenticated SNMPv3 message outside the time window.'
             return $null
@@ -2426,7 +2452,7 @@ function Read-SnmpExchangeReply {
     $header = $scoped.Pdu
 
     if ($header.PduType -eq $script:SnmpPduTypes.Report) {
-        if (-not $currentAttempt) {
+        if (-not $auth -and -not $currentAttempt) {
             return $null
         }
         if (-not $auth -and $Session.SecurityLevel -ne 'NoAuthNoPriv') {
@@ -2439,7 +2465,13 @@ function Read-SnmpExchangeReply {
             # Authenticated for this engine and user (an authNoPriv Report may answer an authPriv
             # request), so it can be acted on.
             if ($report -eq 'notInTimeWindows') {
-                Update-SnmpV3Clock -Session $Session -Boots $message.EngineBoots -Time $message.EngineTime
+                # A late Report can also cover a pending request that has not used the correction.
+                if ($null -ne $entry.AttemptClocks -and $entry.AttemptClocks[$entry.Key] -gt $attemptClock) {
+                    return $null
+                }
+                if ($sameClock) {
+                    Update-SnmpV3Clock -Session $Session -Boots $message.EngineBoots -Time $message.EngineTime -Resynchronize
+                }
                 return [PSCustomObject]@{ Entry = $entry; Action = 'Resend' }
             }
             return [PSCustomObject]@{ Entry = $entry; Action = 'Fail'; Message = (Get-SnmpReportMessage -Session $Session -Report $report) }
@@ -2479,15 +2511,17 @@ function Read-SnmpExchangeReply {
 
 function Find-SnmpV3Engine {
     # RFC 3414 §4 discovery: an empty noAuthNoPriv request should draw a usmStatsUnknownEngineIDs
-    # Report naming the agent's engine. Only that Report, from the session's peer and for this
-    # request's msgID, is accepted. Its boots/time are provisional until an authenticated reply.
+    # Report naming the agent's engine. Match any attempt ID sent in this discovery exchange.
+    # The boots and time stay provisional until an authenticated reply.
     param ([hashtable]$Session, [hashtable]$Deadline)
 
+    $sent = [System.Collections.Generic.HashSet[int]]::new()
     for ($attempt = 0; $attempt -le $Session.Retries; $attempt++) {
         if ($null -ne $Deadline -and $Session.Clock.ElapsedMilliseconds -ge $Deadline.AtMs) {
             throw $Deadline.Message
         }
         $id = New-SnmpRequestId -Session $Session
+        [void]$sent.Add($id)
         $pdu = ConvertTo-SnmpPduBytes -PduType $script:SnmpPduTypes.Get -RequestId $id -Varbinds @()
         Send-SnmpDatagram -Session $Session -Bytes (ConvertTo-SnmpV3Message -Session $Session -MsgId $id -Pdu $pdu -Discovery)
 
@@ -2505,7 +2539,7 @@ function Find-SnmpV3Engine {
             }
             try {
                 $message = ConvertFrom-SnmpMessage -Data $data -Envelope
-                if ($message.Version -ne 3 -or $message.MsgId -ne $id -or ($message.Flags -band 0x03) -ne 0 -or
+                if ($message.Version -ne 3 -or -not $sent.Contains([int]$message.MsgId) -or ($message.Flags -band 0x03) -ne 0 -or
                     $null -eq $message.ScopedPdu -or $message.ScopedPdu.Pdu.PduType -ne $script:SnmpPduTypes.Report -or
                     $message.EngineId.Length -lt 5) {
                     continue
@@ -2522,7 +2556,7 @@ function Find-SnmpV3Engine {
     if ($null -ne $Deadline -and $Session.Clock.ElapsedMilliseconds -ge $Deadline.AtMs) {
         throw $Deadline.Message
     }
-    throw "No SNMPv3 response from $($Session.ComputerName):$($Session.Endpoint.Port) (engine discovery timed out)."
+    throw [System.TimeoutException]::new("No SNMPv3 response from $($Session.ComputerName):$($Session.Endpoint.Port) (engine discovery timed out).")
 }
 
 function Initialize-SnmpV3Engine {
@@ -2533,15 +2567,73 @@ function Initialize-SnmpV3Engine {
 }
 
 function Invoke-SnmpExchange {
-    # Sends requests with up to $Session.Window outstanding and returns the Response PDUs in
-    # request order. Each request is @{ PduType; Oids; [NonRepeaters]; [MaxRepetitions] }.
-    # Each v3 attempt gets a fresh msgID. All attempt IDs can answer the same logical request
-    # until it completes. Only the current attempt can act on a Report.
     param ([hashtable]$Session, [object[]]$Requests, [hashtable]$Deadline)
 
     if ($Session.Version -eq 3 -and $null -eq $Session.EngineId) {
         Initialize-SnmpV3Engine -Session $Session -Deadline $Deadline
     }
+
+    try {
+        return , (Invoke-SnmpExchangeCore -Session $Session -Requests $Requests -Deadline $Deadline)
+    }
+    catch [System.TimeoutException] {
+        if ($Session.Version -ne 3 -or $Session.SecurityLevel -eq 'NoAuthNoPriv' -or $Session.TimeTrusted -or $Session.RediscoveryAttempted) {
+            throw
+        }
+        $initialTimeout = $_
+        $Session.RediscoveryAttempted = $true
+        try {
+            $engine = Find-SnmpV3Engine -Session $Session -Deadline $Deadline
+        }
+        catch [System.TimeoutException] {
+            throw $initialTimeout
+        }
+        if (Test-SnmpBytesEqual $engine.EngineId $Session.EngineId) {
+            throw $initialTimeout
+        }
+
+        # The candidate shares the socket and master keys. It owns only its localized keys.
+        $candidate = $Session.Clone()
+        $candidate.AuthKey = $null
+        $candidate.PrivKey = $null
+        try {
+            Set-SnmpV3Engine -Session $candidate -EngineId $engine.EngineId -Boots $engine.Boots -Time $engine.Time
+            try {
+                $responses = Invoke-SnmpExchangeCore -Session $candidate -Requests $Requests -Deadline $Deadline
+            }
+            catch [System.TimeoutException] {
+                $detail = $_.Exception.Message
+                if (-not $detail.EndsWith($script:SnmpNewSessionAdvice, [StringComparison]::Ordinal)) {
+                    throw [System.TimeoutException]::new($detail + $script:SnmpNewSessionAdvice, $_.Exception)
+                }
+                throw
+            }
+            if (-not $candidate.TimeTrusted) {
+                throw $initialTimeout
+            }
+            Clear-SnmpBytes $Session.AuthKey
+            Clear-SnmpBytes $Session.PrivKey
+            foreach ($name in 'EngineId', 'EngineBoots', 'EngineTime', 'LatestReceivedEngineTime', 'EngineTimeSyncedAt',
+                'TimeTrusted', 'ClockVersion', 'AuthKey', 'PrivKey') {
+                $Session[$name] = $candidate[$name]
+            }
+            $candidate.AuthKey = $null
+            $candidate.PrivKey = $null
+            return , $responses
+        }
+        finally {
+            # Retire the candidate's request IDs even when verification fails.
+            $Session.NextId = $candidate.NextId
+            Clear-SnmpBytes $candidate.AuthKey
+            Clear-SnmpBytes $candidate.PrivKey
+        }
+    }
+}
+
+function Invoke-SnmpExchangeCore {
+    # Pipeline up to $Session.Window requests with a fresh msgID per attempt. Each logical
+    # request keeps its PDU request-id and accepts replies for all of its active attempt IDs.
+    param ([hashtable]$Session, [object[]]$Requests, [hashtable]$Deadline)
 
     $count = $Requests.Count
     $results = [object[]]::new($count)
@@ -2558,7 +2650,7 @@ function Invoke-SnmpExchange {
         $msgId = if ($Session.Version -eq 3) { New-SnmpRequestId -Session $Session } else { $Entry.RequestId }
         $bytes = ConvertTo-SnmpRequestMessage -Session $Session -Request $Entry.Request -RequestId $Entry.RequestId -MsgId $msgId
         if (-not $pending.ContainsKey($msgId)) {
-            $Entry.AttemptIds.Add($msgId)
+            $Entry.AttemptClocks[$msgId] = $Session.ClockVersion
             $pending[$msgId] = $Entry
         }
         $Entry.Key = $msgId
@@ -2573,11 +2665,10 @@ function Invoke-SnmpExchange {
                 Request    = $Requests[$next]
                 RequestId  = New-SnmpRequestId -Session $Session
                 Key        = $null
-                AttemptIds = [System.Collections.Generic.List[int]]::new()
+                AttemptClocks = @{}
                 Attempts   = 1
                 Reports    = 0
                 Hint       = $null
-                StaleClock = $false
                 DeadlineMs = 0
             }
             $active.Add($entry)
@@ -2607,7 +2698,7 @@ function Invoke-SnmpExchange {
                 switch ($reply.Action) {
                     'Complete' {
                         $results[$entry.Index] = $reply.Pdu
-                        foreach ($key in $entry.AttemptIds) {
+                        foreach ($key in $entry.AttemptClocks.Keys) {
                             $pending.Remove($key)
                         }
                         [void]$active.Remove($entry)
@@ -2623,9 +2714,6 @@ function Invoke-SnmpExchange {
                     'Hint' {
                         $entry.Hint = $reply.Hint
                     }
-                    'StaleClock' {
-                        $entry.StaleClock = $true
-                    }
                     'Fail' {
                         throw $reply.Message
                     }
@@ -2639,7 +2727,7 @@ function Invoke-SnmpExchange {
                 continue
             }
             if ($entry.Attempts -gt $Session.Retries) {
-                throw (Get-SnmpTimeoutMessage -Session $Session -Entry $entry)
+                throw [System.TimeoutException]::new((Get-SnmpTimeoutMessage -Session $Session -Entry $entry))
             }
             $entry.Attempts++
             & $send $entry

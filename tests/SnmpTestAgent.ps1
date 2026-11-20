@@ -90,10 +90,16 @@ function Start-SnmpTestAgent {
         [int]$MaxBulkBytes = 4096,
         [ValidateRange(0, 5000)]
         [int]$ResponseDelayMs = 0,
+        [ValidateRange(0, 5000)]
+        [int]$ReportDelayMs = 0,
         [int]$Port = 0
     )
 
     $udp = [System.Net.Sockets.UdpClient]::new([System.Net.IPEndPoint]::new([System.Net.IPAddress]::Loopback, $Port))
+    $engine = [hashtable]::Synchronized(@{
+        Id = [byte[]](@(0x80, 0x00, 0x1F, 0x88, 0x04) + [System.Text.Encoding]::ASCII.GetBytes('nt-test'))
+        Discoveries = 0
+    })
     $options = @{
         Community           = $Community
         V3User              = $V3User
@@ -102,6 +108,8 @@ function Start-SnmpTestAgent {
         MaxBulkVarbinds     = $MaxBulkVarbinds
         MaxBulkBytes        = $MaxBulkBytes
         ResponseDelayMs     = $ResponseDelayMs
+        ReportDelayMs       = $ReportDelayMs
+        Engine              = $engine
     }
 
     $agentScript = {
@@ -232,8 +240,7 @@ function Start-SnmpTestAgent {
                 # would also wipe the keys, so it runs when the agent stops (below).
                 $agentSession.Socket.Dispose()
                 $agentSession.Socket = $null
-                $engineId = [byte[]](@(0x80, 0x00, 0x1F, 0x88, 0x04) + [System.Text.Encoding]::ASCII.GetBytes('nt-test'))
-                Set-SnmpV3Engine -Session $agentSession -EngineId $engineId -Boots 7 -Time 4242
+                Set-SnmpV3Engine -Session $agentSession -EngineId $Options.Engine.Id -Boots 7 -Time 4242
             }
 
             $sendReport = {
@@ -250,6 +257,9 @@ function Start-SnmpTestAgent {
                     $reportSession.EngineTimeSyncedAt = $reportSession.Clock.Elapsed.TotalSeconds
                 }
                 $bytes = ConvertTo-SnmpV3Message -Session $reportSession -MsgId $message.MsgId -Pdu $reportPdu -SecurityLevel $level -Reportable $false -UserName $message.UserName
+                if ($Options.ReportDelayMs -gt 0) {
+                    Start-Sleep -Milliseconds $Options.ReportDelayMs
+                }
                 [void]$Udp.Send($bytes, $bytes.Length, $remote)
             }
 
@@ -292,7 +302,14 @@ function Start-SnmpTestAgent {
                     if ($null -eq $agentSession) {
                         continue
                     }
-                    if ($message.EngineId.Length -eq 0) {
+                    $engineId = $Options.Engine.Id
+                    if (-not (Test-SnmpBytesEqual $engineId $agentSession.EngineId)) {
+                        Set-SnmpV3Engine -Session $agentSession -EngineId $engineId -Boots 7 -Time 4242
+                    }
+                    if (-not (Test-SnmpBytesEqual $message.EngineId $agentSession.EngineId)) {
+                        if ($message.EngineId.Length -eq 0) {
+                            $Options.Engine.Discoveries++
+                        }
                         & $sendReport $remote $message '1.3.6.1.6.3.15.1.1.4.0' 'NoAuthNoPriv'
                         continue
                     }
@@ -343,6 +360,7 @@ function Start-SnmpTestAgent {
         Udp        = $udp
         PowerShell = $powershell
         Handle     = $handle
+        Engine     = $engine
     }
 }
 
