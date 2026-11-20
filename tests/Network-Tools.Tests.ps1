@@ -135,6 +135,18 @@ Describe 'Send-Stimulus' {
 }
 
 Describe 'Invoke-NetworkScan' {
+    BeforeEach {
+        Mock Invoke-NetworkScanProbe -ModuleName Network-Tools {
+            if ($Addresses -contains '127.0.0.1') {
+                [PSCustomObject]@{ IPAddress = '127.0.0.1'; LatencyMs = 0 }
+            }
+        }
+
+        Mock Get-ArpTable -ModuleName Network-Tools {
+            @{ '127.0.0.1' = '00:11:22:33:44:55' }
+        }
+    }
+
     It 'runs without platform-specific command failures on a /32 target' {
         $thrown = $false
         $result = $null
@@ -151,48 +163,21 @@ Describe 'Invoke-NetworkScan' {
     }
 
     It 'accepts ResolveMacVendor flag without errors' {
-        $thrown = $false
-        $result = $null
+        $result = @(Invoke-NetworkScan -Target '127.0.0.1/30' -TimeoutMs 50 -ThrottleLimit 4 -ResolveMacVendor)
 
-        try {
-            $result = Invoke-NetworkScan -Target '127.0.0.1/32' -TimeoutMs 50 -ThrottleLimit 4 -ResolveMacVendor
-        }
-        catch {
-            $thrown = $true
-        }
-
-        $thrown | Should Be $false
-        @($result).Count | Should Be 0
+        $result.Count | Should Be 1
     }
 
     It 'accepts ResolveDns flag without errors' {
-        $thrown = $false
-        $result = $null
+        $result = @(Invoke-NetworkScan -Target '127.0.0.1/30' -TimeoutMs 50 -ThrottleLimit 4 -ResolveDns)
 
-        try {
-            $result = Invoke-NetworkScan -Target '127.0.0.1/32' -TimeoutMs 50 -ThrottleLimit 4 -ResolveDns
-        }
-        catch {
-            $thrown = $true
-        }
-
-        $thrown | Should Be $false
-        @($result).Count | Should Be 0
+        $result.Count | Should Be 1
     }
 
     It 'accepts DnsTimeout in seconds without errors' {
-        $thrown = $false
-        $result = $null
+        $result = @(Invoke-NetworkScan -Target '127.0.0.1/30' -TimeoutMs 50 -ThrottleLimit 4 -ResolveDns -DnsTimeout 10)
 
-        try {
-            $result = Invoke-NetworkScan -Target '127.0.0.1/32' -TimeoutMs 50 -ThrottleLimit 4 -ResolveDns -DnsTimeout 10
-        }
-        catch {
-            $thrown = $true
-        }
-
-        $thrown | Should Be $false
-        @($result).Count | Should Be 0
+        $result.Count | Should Be 1
     }
 
     It 'emits ScanResult objects carrying a Hostname property' {
@@ -208,11 +193,8 @@ Describe 'Invoke-NetworkScan' {
 
     It 'retries ARP lookup when the first snapshot is empty' {
         InModuleScope Network-Tools {
+            $script:arpSnapshotCallCount = 0
             Mock Get-ArpTable {
-                if ($script:arpSnapshotCallCount -eq $null) {
-                    $script:arpSnapshotCallCount = 0
-                }
-
                 $script:arpSnapshotCallCount++
                 if ($script:arpSnapshotCallCount -eq 1) {
                     @{}
@@ -233,26 +215,27 @@ Describe 'Invoke-NetworkScan' {
         $result = Invoke-NetworkScan -Target '127.0.0.1/30' -TimeoutMs 100 -ThrottleLimit 4 -ResolveMacVendor
 
         $hostResult = @($result) | Where-Object { $_.IPAddress -eq '127.0.0.1' }
-        $hostResult.Count | Should BeGreaterThan 0
+        $hostResult.Count | Should Be 1
+        Assert-MockCalled Get-ArpTable -ModuleName Network-Tools -Scope It -Times 2 -Exactly
         $hostResult[0].MACAddress | Should Be '00:11:22:33:44:55'
         $hostResult[0].MACVendor | Should Be 'Contoso Ltd'
     }
 
     It 'places Hostname before IPAddress in the object property order' {
-        $result = Invoke-NetworkScan -Target '127.0.0.1/30' -TimeoutMs 100 -ThrottleLimit 4 -ResolveDns
+        $result = @(Invoke-NetworkScan -Target '127.0.0.1/30' -TimeoutMs 100 -ThrottleLimit 4 -ResolveDns)
 
+        $result.Count | Should Be 1
         $names = @($result[0].PSObject.Properties.Name)
         $names[0] | Should Be 'Hostname'
         $names[1] | Should Be 'IPAddress'
     }
 
     It 'leaves Hostname null when ResolveDns is not specified' {
-        $result = Invoke-NetworkScan -Target '127.0.0.1/30' -TimeoutMs 100 -ThrottleLimit 4
+        $result = @(Invoke-NetworkScan -Target '127.0.0.1/30' -TimeoutMs 100 -ThrottleLimit 4)
 
-        foreach ($h in @($result)) {
-            $h.PSObject.Properties.Name -contains 'Hostname' | Should Be $true
-            $h.Hostname | Should BeNullOrEmpty
-        }
+        $result.Count | Should Be 1
+        $result[0].PSObject.Properties.Name -contains 'Hostname' | Should Be $true
+        $result[0].Hostname | Should BeNullOrEmpty
     }
 }
 

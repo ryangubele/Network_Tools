@@ -432,6 +432,33 @@ function Convert-FromCidr {
     }
 }
 
+function Invoke-NetworkScanProbe {
+    param (
+        [System.Collections.Generic.IEnumerable[string]]$Addresses,
+        [int]$TimeoutMs,
+        [int]$ThrottleLimit
+    )
+
+    $Addresses |
+        ForEach-Object -Parallel {
+            $ping = [System.Net.NetworkInformation.Ping]::new()
+            try {
+                $reply = $ping.Send($_, $using:TimeoutMs)
+                if ($reply.Status -eq 'Success') {
+                    [PSCustomObject]@{
+                        IPAddress = $_
+                        LatencyMs = $reply.RoundtripTime
+                    }
+                }
+            }
+            catch {
+            }
+            finally {
+                $ping.Dispose()
+            }
+        } -ThrottleLimit $ThrottleLimit
+}
+
 function Invoke-NetworkScan {
     <#
     .SYNOPSIS
@@ -540,24 +567,7 @@ function Invoke-NetworkScan {
         }
     }
 
-    $ipList |
-        ForEach-Object -Parallel {
-            $ping = [System.Net.NetworkInformation.Ping]::new()
-            try {
-                $reply = $ping.Send($_, $using:TimeoutMs)
-                if ($reply.Status -eq 'Success') {
-                    [PSCustomObject]@{
-                        IPAddress = $_
-                        LatencyMs = $reply.RoundtripTime
-                    }
-                }
-            }
-            catch {
-            }
-            finally {
-                $ping.Dispose()
-            }
-        } -ThrottleLimit $ThrottleLimit |
+    Invoke-NetworkScanProbe -Addresses $ipList -TimeoutMs $TimeoutMs -ThrottleLimit $ThrottleLimit |
         ForEach-Object {
             $mac = if ($arpTable.ContainsKey($_.IPAddress)) {
                 $arpTable[$_.IPAddress]
