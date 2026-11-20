@@ -1,6 +1,6 @@
 @{
     RootModule = 'Network-Tools.psm1'
-    ModuleVersion = '0.1.6'
+    ModuleVersion = '0.1.7'
     GUID = 'f8fceb5b-c4b5-4702-b622-08561fcb6b39'
     Author = 'Network Engineering Tools'
     CompanyName = 'Community'
