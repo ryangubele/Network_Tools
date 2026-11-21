@@ -218,7 +218,7 @@ Describe 'Invoke-NetworkScan' {
 
         $hostResult = @($result) | Where-Object { $_.IPAddress -eq '127.0.0.1' }
         $hostResult.Count | Should -Be 1
-        Assert-MockCalled Get-ArpTable -ModuleName Network-Tools -Scope It -Times 2 -Exactly
+        Should -Invoke Get-ArpTable -ModuleName Network-Tools -Scope It -Times 2 -Exactly
         $hostResult[0].MACAddress | Should -Be '00:11:22:33:44:55'
         $hostResult[0].MACVendor | Should -Be 'Contoso Ltd'
     }
