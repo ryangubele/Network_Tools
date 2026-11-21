@@ -186,6 +186,18 @@ Invoke-BwMon 127.0.0.1 -Port $agent.Port
 Stop-SnmpTestAgent $agent
 ```
 
+## Web UI demo
+
+A minimal browser front end for every command lives in `scripts/Start-NetworkToolsWebUI.ps1`. It is pure PowerShell 7 (System.Net.HttpListener) with one self-contained page, so there is nothing to install.
+
+```powershell
+.\scripts\Start-NetworkToolsWebUI.ps1 -Port 8080
+```
+
+Open http://localhost:8080/. There is a tab per command, and each tab is a form built from that command's parameters (switches are checkboxes, validated values are drop-downs, and array parameters take comma-separated values). Run executes the command and shows its output and errors in the panel below the form. Each run is stopped after `-TimeoutSeconds` (60 by default). Press Ctrl+C, or open http://localhost:8080/stop, to shut it down.
+
+The UI runs commands on the local machine as the current user, so it only listens on localhost and is meant as a demo, not something to expose on a network. Invoke-BandwidthMonitor needs an interactive terminal, so use Get-SnmpInterface in the web UI instead. Invoke-NetworkScan and Send-Stimulus behave the same as at the console, including any permissions they need.
+
 ## Tests
 
 The tests require Pester 5 on Windows and Linux. Install it, then load it explicitly so the Pester 3.4 that ships with Windows isn't used instead:
